@@ -337,9 +337,9 @@ logs/rules.log
 
 ## License
 
-建议使用 GPL-3.0。
+GPL-3.0。
 
-如果发布包中包含 mihomo 内核，请同时遵守 mihomo 自身许可证要求，并在发布说明中注明本项目依赖 mihomo。不要删除第三方项目的许可证声明。
+本项目依赖 mihomo。
 
 ---
 
