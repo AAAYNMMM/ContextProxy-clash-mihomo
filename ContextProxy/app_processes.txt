@@ -1,0 +1,4 @@
+Proxy,chrome.exe
+Media,HillsLite.exe
+Proxy,brave.exe
+AI,Code.exe
