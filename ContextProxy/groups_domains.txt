@@ -1,8 +1,0 @@
-AI,*.chatgpt.*
-AI,*.openai.*
-Proxy,www.google.*
-Media,*.youtube.*
-Proxy,*.github.*
-AI,*.gemini.*
-Proxy,*.ippure.*
-AI,gemini.google.com
