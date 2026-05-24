@@ -1,8 +1,14 @@
 # ContextProxy
 
-ContextProxy 是一个面向 Windows 桌面的本地分流代理客户端。它通过 **浏览器扩展上报 Tab 上下文 + Python 前置代理 + mihomo 单核心多 listener** 的方式，把不同网站、应用进程的流量分配到不同代理分组。
+## 基于上下文的智能分流
 
-项目目标不是替代 Clash / v2rayN 的所有能力，而是实现更适合本地使用的“上下文分流”：同一个浏览器、同一个系统代理入口下，也可以根据当前标签页、请求域名、应用进程，把流量分到不同分组。
+ContextProxy 的核心优势是“按上下文分流”，而不是传统代理客户端常见的单一全局代理或简单域名规则。它可以结合浏览器 Tab 上报、请求域名、App 进程规则，判断流量应该进入哪个分组，例如 Proxy、AI、Media 或用户自定义分组。
+
+这种方式更适合现代使用场景：
+
+### 软件根据进程名进入不同分组，减少手动切换节点和规则维护成本。
+
+### 在可添加扩展的浏览器中，规则仅仅只需要填写标签站的域名，网页内的静态and动态域名都会归于标签域名之下，极大减少了维护规则的成本。
 
 ---
 
@@ -323,109 +329,9 @@ logs/tcp.log
 logs/rules.log
 ```
 
-打包发布前可以删除整个 `logs/` 目录。
 
 ---
 
-## 打包
-
-推荐使用 PyInstaller 的 onedir 模式。
-
-### 测试版，保留控制台
-
-```powershell
-Remove-Item -Recurse -Force build, dist -ErrorAction SilentlyContinue
-
-.\.venv\Scripts\python.exe -m PyInstaller `
-  --noconfirm `
-  --clean `
-  --onedir `
-  --console `
-  --name ContextProxy `
-  gui\app.py
-```
-
-### 正式版，无控制台
-
-```powershell
-Remove-Item -Recurse -Force build, dist -ErrorAction SilentlyContinue
-
-.\.venv\Scripts\python.exe -m PyInstaller `
-  --noconfirm `
-  --clean `
-  --onedir `
-  --windowed `
-  --name ContextProxy `
-  gui\app.py
-```
-
-### 复制外部资源
-
-```powershell
-New-Item -ItemType Directory -Force dist\ContextProxy\logs | Out-Null
-
-xcopy config dist\ContextProxy\config /E /I /Y
-xcopy extension dist\ContextProxy\extension /E /I /Y
-xcopy mihomo dist\ContextProxy\mihomo /E /I /Y
-
-copy app_processes.txt dist\ContextProxy\app_processes.txt
-copy groups_domains.txt dist\ContextProxy\groups_domains.txt
-copy requirements.txt dist\ContextProxy\requirements.txt
-copy README.md dist\ContextProxy\README.md
-```
-
-最终发布目录：
-
-```text
-dist/ContextProxy/
-  ContextProxy.exe
-  _internal/
-  config/
-  extension/
-  mihomo/
-  logs/
-  app_processes.txt
-  groups_domains.txt
-  requirements.txt
-  README.md
-```
-
-用户运行：
-
-```text
-ContextProxy.exe
-```
-
----
-
-## 发布前清理建议
-
-不要发布：
-
-```text
-.venv/
-build/
-__pycache__/
-*.pyc
-logs/
-真实订阅链接
-真实节点文件
-config/runtime_selected_nodes.yaml
-mihomo/config.yaml
-mihomo/config.yaml.tmp
-```
-
-如果包含 `config/subscriptions/subscriptions.yaml`，建议使用空模板：
-
-```yaml
-subscriptions: []
-```
-
-如果包含 `config/node_pool.yaml`，建议使用空模板：
-
-```yaml
-nodes: {}
-```
 
 ---
 
