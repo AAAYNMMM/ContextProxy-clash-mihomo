@@ -2,6 +2,7 @@ import os
 import subprocess
 from pathlib import Path
 
+from backend.activity_bus import write_log
 from backend.config import MIHOMO_DIR
 from backend.mihomo_config_generator import generate_all_configs
 from backend.mihomo_paths import get_mihomo_exe_path, mihomo_exe_missing_message
@@ -40,7 +41,7 @@ def _force_kill_process(process: subprocess.Popen):
             process.kill()
         process.wait(timeout=3)
     except Exception as exc:
-        print(f"[mihomo] force kill failed pid={process.pid}: {exc}")
+        write_log("mihomo", f"force kill failed pid={process.pid}: {exc}", "WARN")
 
 
 def _is_main_config_command(command_line: str) -> bool:
@@ -75,7 +76,7 @@ def _find_existing_main_mihomo_pids() -> list[int]:
 def _cleanup_recorded_process_if_exited():
     global mihomo_process
     if mihomo_process is not None and mihomo_process.poll() is not None:
-        print(f"[mihomo] recorded process already exited, pid={mihomo_process.pid}")
+        write_log("mihomo", f"recorded process already exited, pid={mihomo_process.pid}", "WARN")
         close_process_log(mihomo_process)
         mihomo_process = None
 
@@ -85,19 +86,19 @@ def launch_mihomo_all():
 
     _cleanup_recorded_process_if_exited()
     if is_process_running(mihomo_process):
-        print(f"[mihomo] single core already running, pid={mihomo_process.pid}")
+        write_log("mihomo", f"single core already running, pid={mihomo_process.pid}")
         return mihomo_process
 
     existing_pids = _find_existing_main_mihomo_pids()
     if existing_pids:
-        print(f"[mihomo] single core already exists, pids={existing_pids}; skip duplicate launch")
+        write_log("mihomo", f"single core already exists, pids={existing_pids}; skip duplicate launch", "WARN")
         return None
 
     ok, error, changes = prepare_mihomo_runtime_ports(write_settings=True, check_system=True)
     if not ok:
         raise RuntimeError(error or "mihomo runtime port check failed")
     for change in changes:
-        print(f"[mihomo] runtime port adjusted: {change}")
+        write_log("mihomo", f"runtime port adjusted: {change}")
 
     generate_all_configs()
 
@@ -112,14 +113,14 @@ def launch_mihomo_all():
 
     extra_flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if os.name == "nt" else 0
 
-    print(f"[mihomo] launch single core: {exe_path} -f {config_file}")
+    write_log("mihomo", f"launch single core: {exe_path} -f {config_file}")
     mihomo_process = popen_hidden(
         [exe_path, "-f", config_file],
         log_name="mihomo.log",
         extra_flags=extra_flags,
     )
 
-    print(f"[mihomo] single core started, pid={mihomo_process.pid}, config={config_file}")
+    write_log("mihomo", f"single core started, pid={mihomo_process.pid}, config={config_file}")
     return mihomo_process
 
 
@@ -128,7 +129,7 @@ def stop_all_mihomo():
 
     process = mihomo_process
     if is_process_running(process):
-        print(f"[mihomo] stopping single core, pid={process.pid}")
+        write_log("mihomo", f"stopping single core, pid={process.pid}")
         try:
             process.terminate()
             process.wait(timeout=2)
@@ -138,13 +139,19 @@ def stop_all_mihomo():
         if process.poll() is None:
             _force_kill_process(process)
 
-        print("[mihomo] single core stopped")
+        write_log("mihomo", "single core stopped")
 
     if process is not None:
         close_process_log(process)
 
     mihomo_process = None
     _stop_residual_main_config_processes()
+
+
+def restart_mihomo_core():
+    write_log("mihomo", "restarting single core", "WARN")
+    stop_all_mihomo()
+    return launch_mihomo_all()
 
 
 def _stop_residual_main_config_processes():

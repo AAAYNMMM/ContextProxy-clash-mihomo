@@ -18,7 +18,7 @@ def get_default_app_settings() -> dict:
             "check_interval": 20,
             "max_fail_count": 2,
             "delay_timeout_ms": 5000,
-            "test_url": "http://www.gstatic.com/generate_204",
+            "test_url": "https://www.gstatic.com/generate_204",
         },
         "mihomo": {
             "exe": "",
@@ -108,7 +108,13 @@ def load_app_settings() -> dict:
             defaults["auto_select"]["delay_timeout_ms"],
             1000,
         )
-        settings["auto_select"]["test_url"] = str(auto_select.get("test_url") or defaults["auto_select"]["test_url"])
+        test_url = str(auto_select.get("test_url") or defaults["auto_select"]["test_url"])
+        if test_url in {
+            "http://www.gstatic.com/generate_204",
+            "http://www.google.com/generate_204",
+        }:
+            test_url = "https://www.gstatic.com/generate_204"
+        settings["auto_select"]["test_url"] = test_url
 
     mihomo = raw.get("mihomo", {})
     if isinstance(mihomo, dict):

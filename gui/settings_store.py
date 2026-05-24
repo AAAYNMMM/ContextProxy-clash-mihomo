@@ -18,7 +18,7 @@ def get_default_settings() -> dict:
             "check_interval": 20,
             "max_fail_count": 2,
             "delay_timeout_ms": 5000,
-            "test_url": "http://www.gstatic.com/generate_204",
+            "test_url": "https://www.gstatic.com/generate_204",
         },
         "mihomo": {
             "exe": "",
@@ -89,6 +89,13 @@ def _merge_defaults(settings: dict) -> dict:
         for key in defaults.keys():
             if key in incoming:
                 merged[section][key] = incoming[key]
+
+    test_url = str(merged.get("auto_select", {}).get("test_url") or "")
+    if test_url in {
+        "http://www.gstatic.com/generate_204",
+        "http://www.google.com/generate_204",
+    }:
+        merged["auto_select"]["test_url"] = "https://www.gstatic.com/generate_204"
 
     return merged
 

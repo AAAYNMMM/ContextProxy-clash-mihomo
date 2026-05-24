@@ -35,7 +35,7 @@ DEFAULT_APP_SETTINGS = {
         "check_interval": 20,
         "max_fail_count": 2,
         "delay_timeout_ms": 5000,
-        "test_url": "http://www.gstatic.com/generate_204",
+        "test_url": "https://www.gstatic.com/generate_204",
     },
     "ui": {
         "close_to_tray": True,
@@ -140,6 +140,13 @@ def _merge_missing_defaults(existing, defaults):
 def ensure_app_settings_file() -> None:
     existing = _load_yaml(APP_SETTINGS_FILE)
     settings, changed = _merge_missing_defaults(existing, DEFAULT_APP_SETTINGS)
+    auto_select = settings.get("auto_select", {})
+    if isinstance(auto_select, dict) and auto_select.get("test_url") in {
+        "http://www.gstatic.com/generate_204",
+        "http://www.google.com/generate_204",
+    }:
+        auto_select["test_url"] = "https://www.gstatic.com/generate_204"
+        changed = True
     if changed or not APP_SETTINGS_FILE.is_file():
         settings["updated_at"] = _now_str()
         _save_yaml(APP_SETTINGS_FILE, settings)

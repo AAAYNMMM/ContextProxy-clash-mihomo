@@ -1,5 +1,7 @@
 import time
 
+from backend.activity_bus import write_log
+
 
 HOLD_AFTER_CLOSE_SECONDS = 0.8
 
@@ -21,7 +23,7 @@ def close_changed_groups(changed_groups):
     from backend.tcp_proxy import close_connections_by_groups
     from backend.mihomo_controller import close_mihomo_connections_by_groups
 
-    print(f"[connections] closing changed groups: {sorted(changed_groups)}")
+    write_log("connections", f"closing changed groups: {sorted(changed_groups)}")
 
     mark_groups_restarting(changed_groups)
 
@@ -34,4 +36,4 @@ def close_changed_groups(changed_groups):
     finally:
         unmark_groups_restarting(changed_groups)
 
-    print(f"[connections] changed groups handled: {sorted(changed_groups)}")
+    write_log("connections", f"changed groups handled: {sorted(changed_groups)}")

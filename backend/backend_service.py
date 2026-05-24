@@ -15,6 +15,7 @@ from backend.local_http import local_get
 from backend.mihomo_launcher import launch_mihomo_all, stop_all_mihomo
 from backend.paths import APP_PROCESSES_FILE, GROUPS_DOMAINS_FILE, LOGS_DIR
 from backend.process_cache import start_process_cache_watcher, stop_process_cache_watcher
+from backend.group_health import start_group_health_monitor, stop_group_health_monitor
 from backend.receiver import start_receiver, stop_receiver
 from backend.tcp_proxy import async_stop_tcp_proxy, start_tcp_proxy, stop_tcp_proxy
 
@@ -265,6 +266,7 @@ class BackendService:
             self._create_task(start_batch_processor(), "batch_processor")
             self._create_task(start_app_process_watcher(), "app_process_watcher")
             self._create_task(start_process_cache_watcher(), "process_cache")
+            self._create_task(start_group_health_monitor(), "group_health")
             self._create_task(start_tcp_proxy(), "tcp_proxy")
             self._create_task(start_receiver(), "receiver")
             self.log(f"[BackendService] async tasks scheduled in {time.perf_counter() - step_start:.2f}s")
@@ -318,6 +320,11 @@ class BackendService:
             stop_process_cache_watcher()
         except Exception as exc:
             self.log(f"[BackendService] process cache stop failed: {exc}")
+
+        try:
+            stop_group_health_monitor()
+        except Exception as exc:
+            self.log(f"[BackendService] group health stop failed: {exc}")
 
         try:
             stop_auto_selector()

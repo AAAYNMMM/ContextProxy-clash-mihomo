@@ -14,6 +14,7 @@ from backend.app_process_rules import match_process_group
 from backend.group_runtime_state import is_group_restarting
 from backend.process_cache import cache_process_lookup_miss, get_process_lookup_from_cache
 from backend.activity_bus import emit_activity, emit_routing_event, write_log
+from backend.group_health import record_proxy_connection_result
 
 
 tcp_server = None
@@ -31,6 +32,9 @@ HIGH_THROUGHPUT_WINDOW_SECONDS = 2.0
 HIGH_THROUGHPUT_BYTES = 2 * 1024 * 1024
 LOW_THROUGHPUT_WINDOW_SECONDS = 10.0
 LOW_THROUGHPUT_BYTES = 512 * 1024
+DRAIN_TIMEOUT_SECONDS = 30
+QUICK_FAIL_SECONDS = 3.0
+MIN_RESPONSE_BYTES_FOR_SUCCESS = 256
 
 GROUP_WAIT_TIMEOUT = 0.08
 GROUP_WAIT_STEP = 0.005
@@ -219,6 +223,9 @@ def _extract_cached_group(request_host: str):
 
     # 鍏煎鏃ф牸寮忥細REQUEST_GROUP_MAP[host] = "AI"
     if isinstance(entry, str):
+        if entry != DIRECT and entry not in get_group_port_map():
+            REQUEST_GROUP_MAP.pop(request_host, None)
+            return None
         return entry
 
     # 褰撳墠鏍煎紡锛歊EQUEST_GROUP_MAP[host] = {"group": "AI", "created_at": time.monotonic()}
@@ -230,6 +237,9 @@ def _extract_cached_group(request_host: str):
             return None
 
         if time.monotonic() - created_at <= REQUEST_GROUP_CACHE_TTL:
+            if group != DIRECT and group not in get_group_port_map():
+                REQUEST_GROUP_MAP.pop(request_host, None)
+                return None
             return group
 
         try:
@@ -345,6 +355,11 @@ def register_active_connection(
             "final_group": final_group,
             "process_name": (process_name or "").lower().strip(),
             "created_at": time.monotonic(),
+            "last_active_at": time.monotonic(),
+            "bytes_from_client": 0,
+            "bytes_to_client": 0,
+            "drain_timeout_count": 0,
+            "failure_reason": None,
         }
 
     return conn_id
@@ -354,6 +369,79 @@ def unregister_active_connection(conn_id):
     if conn_id is not None:
         with ACTIVE_CONNECTIONS_LOCK:
             ACTIVE_CONNECTIONS.pop(conn_id, None)
+
+
+def mark_connection_failure(conn_id, reason: str):
+    if conn_id is None:
+        return
+
+    with ACTIVE_CONNECTIONS_LOCK:
+        info = ACTIVE_CONNECTIONS.get(conn_id)
+        if info is not None and not info.get("failure_reason"):
+            info["failure_reason"] = reason
+
+
+def update_connection_activity(conn_id, direction: str, byte_count: int):
+    if conn_id is None:
+        return
+
+    with ACTIVE_CONNECTIONS_LOCK:
+        info = ACTIVE_CONNECTIONS.get(conn_id)
+        if not info:
+            return
+
+        info["last_active_at"] = time.monotonic()
+        if direction == "client_to_remote":
+            info["bytes_from_client"] = int(info.get("bytes_from_client") or 0) + int(byte_count)
+        elif direction == "remote_to_client":
+            info["bytes_to_client"] = int(info.get("bytes_to_client") or 0) + int(byte_count)
+
+
+def increment_drain_timeout(conn_id):
+    if conn_id is None:
+        return
+
+    with ACTIVE_CONNECTIONS_LOCK:
+        info = ACTIVE_CONNECTIONS.get(conn_id)
+        if not info:
+            return
+        info["drain_timeout_count"] = int(info.get("drain_timeout_count") or 0) + 1
+        if not info.get("failure_reason"):
+            info["failure_reason"] = "drain_timeout"
+
+
+def finalize_active_connection(conn_id):
+    if conn_id is None:
+        return
+
+    with ACTIVE_CONNECTIONS_LOCK:
+        info = ACTIVE_CONNECTIONS.pop(conn_id, None)
+
+    if not info:
+        return
+
+    final_group = str(info.get("final_group") or "")
+    if final_group == DIRECT:
+        return
+
+    duration = time.monotonic() - float(info.get("created_at") or time.monotonic())
+    bytes_from_client = int(info.get("bytes_from_client") or 0)
+    bytes_to_client = int(info.get("bytes_to_client") or 0)
+    failure_reason = info.get("failure_reason")
+
+    success = True
+    reason = "ok"
+    if failure_reason:
+        success = False
+        reason = str(failure_reason)
+    elif bytes_from_client > 0 and bytes_to_client == 0:
+        success = False
+        reason = "no_response"
+    elif duration < QUICK_FAIL_SECONDS and bytes_from_client + bytes_to_client < MIN_RESPONSE_BYTES_FOR_SUCCESS:
+        success = False
+        reason = "quick_close_low_bytes"
+
+    record_proxy_connection_result(final_group, success, reason)
 
 
 def set_remote_writer(conn_id, remote_writer):
@@ -552,7 +640,21 @@ def close_all_active_connections():
     write_log("tcp", f"closed all active connections: {closed}")
 
 
-async def pipe(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, label: str = ""):
+async def safe_drain(writer: asyncio.StreamWriter, conn_id=None):
+    try:
+        await asyncio.wait_for(writer.drain(), timeout=DRAIN_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError:
+        increment_drain_timeout(conn_id)
+        raise
+
+
+async def pipe(
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+    label: str = "",
+    conn_id=None,
+    direction: str = "",
+):
     """
     鍗曞悜杞彂鏁版嵁銆?    """
     total_bytes = 0
@@ -599,15 +701,18 @@ async def pipe(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, label
 
             writer.write(data)
             pending_write_bytes += data_size
+            update_connection_activity(conn_id, direction, data_size)
             if pending_write_bytes >= drain_threshold:
-                await writer.drain()
+                await safe_drain(writer, conn_id)
                 pending_write_bytes = 0
 
         if pending_write_bytes:
-            await writer.drain()
+            await safe_drain(writer, conn_id)
 
     except Exception as e:
-        if not is_normal_socket_error(e):
+        if isinstance(e, asyncio.TimeoutError):
+            write_log("tcp", f"forwarding drain timeout: {label or '-'}", "WARN")
+        elif not is_normal_socket_error(e):
             write_log("tcp", f"forwarding error: {e}", "WARN")
 
     finally:
@@ -619,14 +724,15 @@ async def tunnel_bidirectional(
     client_writer: asyncio.StreamWriter,
     remote_reader: asyncio.StreamReader,
     remote_writer: asyncio.StreamWriter,
+    conn_id=None,
 ):
     """
     鍙屽悜杞彂銆?    """
     tune_socket(client_writer)
     tune_socket(remote_writer)
     await asyncio.gather(
-        pipe(client_reader, remote_writer, "client->remote"),
-        pipe(remote_reader, client_writer, "remote->client"),
+        pipe(client_reader, remote_writer, "client->remote", conn_id, "client_to_remote"),
+        pipe(remote_reader, client_writer, "remote->client", conn_id, "remote_to_client"),
     )
 
 
@@ -651,7 +757,7 @@ async def handle_direct_connect(
     set_remote_writer(conn_id, remote_writer)
 
     client_writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-    await client_writer.drain()
+    await safe_drain(client_writer, conn_id)
 
     write_log("tcp", f"DIRECT CONNECT {request_host}:{request_port}", "DEBUG")
 
@@ -660,6 +766,7 @@ async def handle_direct_connect(
         client_writer,
         remote_reader,
         remote_writer,
+        conn_id,
     )
 
 
@@ -686,7 +793,7 @@ async def handle_direct_http(
     first_data = rewrite_http_request_for_direct(first_data)
 
     remote_writer.write(first_data)
-    await remote_writer.drain()
+    await safe_drain(remote_writer, conn_id)
 
     write_log("tcp", f"DIRECT HTTP {request_host}:{request_port}", "DEBUG")
 
@@ -695,6 +802,7 @@ async def handle_direct_http(
         client_writer,
         remote_reader,
         remote_writer,
+        conn_id,
     )
 
 
@@ -710,18 +818,22 @@ async def handle_proxy_forward(
     """
     杞彂缁?mihomo 鏈湴 HTTP 浠ｇ悊绔彛銆?
     杩欓噷淇濇寔鍘熷 CONNECT / HTTP proxy 璇锋眰鏍煎紡涓嶅彉锛?    鍥犱负 mihomo 鐨?port 绔彛鏈潵灏辨槸 HTTP 浠ｇ悊绔彛銆?    """
-    remote_reader, remote_writer = await asyncio.open_connection(
-        "127.0.0.1",
-        target_port,
-        limit=STREAM_LIMIT,
-    )
+    try:
+        remote_reader, remote_writer = await asyncio.open_connection(
+            "127.0.0.1",
+            target_port,
+            limit=STREAM_LIMIT,
+        )
+    except Exception:
+        mark_connection_failure(conn_id, "listener_connect_fail")
+        raise
     tune_socket(client_writer)
     tune_socket(remote_writer)
 
     set_remote_writer(conn_id, remote_writer)
 
     remote_writer.write(first_data)
-    await remote_writer.drain()
+    await safe_drain(remote_writer, conn_id)
 
     write_log("tcp", f"{request_host} -> {final_group} -> 127.0.0.1:{target_port}")
 
@@ -730,6 +842,7 @@ async def handle_proxy_forward(
         client_writer,
         remote_reader,
         remote_writer,
+        conn_id,
     )
 
 
@@ -865,7 +978,7 @@ async def handle_client(
         force_close_writer(client_writer)
 
     finally:
-        unregister_active_connection(conn_id)
+        finalize_active_connection(conn_id)
 
 
 async def start_tcp_proxy():

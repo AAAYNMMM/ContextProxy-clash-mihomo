@@ -15,6 +15,8 @@ NODE_POOL_FILE = CONFIG_DIR / "node_pool.yaml"
 MAX_WORKERS = 12
 DELAY_TEST_LOCK = threading.Lock()
 DELAY_TEST_CANCEL_EVENT = threading.Event()
+PRIMARY_HEALTH_CHECK_URL = "https://www.gstatic.com/generate_204"
+FALLBACK_HEALTH_CHECK_URL = "https://cp.cloudflare.com/generate_204"
 
 
 def _load_yaml(path: Path) -> dict:
@@ -38,7 +40,21 @@ def _load_node_pool() -> dict:
 
 def _test_url() -> str:
     auto_settings = get_auto_select_settings()
-    return str(auto_settings.get("test_url") or "http://www.gstatic.com/generate_204")
+    test_url = str(auto_settings.get("test_url") or PRIMARY_HEALTH_CHECK_URL)
+    if test_url in {
+        "http://www.gstatic.com/generate_204",
+        "http://www.google.com/generate_204",
+    }:
+        return PRIMARY_HEALTH_CHECK_URL
+    return test_url
+
+
+def health_check_urls() -> list[str]:
+    urls = []
+    for url in (_test_url(), PRIMARY_HEALTH_CHECK_URL, FALLBACK_HEALTH_CHECK_URL):
+        if url and url not in urls:
+            urls.append(url)
+    return urls
 
 
 def _timeout_ms() -> int:
@@ -88,6 +104,7 @@ def test_node_delay_via_main_controller(
     controller_port: int | None = None,
     node: dict | None = None,
     allow_retry: bool = True,
+    test_url: str | None = None,
 ) -> dict:
     controller_port = controller_port or get_mihomo_controller_port()
     timeout_ms = _node_timeout_ms(node)
@@ -100,7 +117,7 @@ def test_node_delay_via_main_controller(
         try:
             response = local_get(
                 url,
-                params={"url": _test_url(), "timeout": str(timeout_ms)},
+                params={"url": test_url or _test_url(), "timeout": str(timeout_ms)},
                 timeout=(timeout_ms / 1000) + 3,
             )
             response.raise_for_status()

@@ -1,7 +1,9 @@
 from pathlib import Path
 from datetime import datetime
+import copy
 import re
 import socket
+import time
 
 from PySide6.QtCore import QObject, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QAction, QColor, QFont, QIcon, QPainter, QPen, QPixmap, QTextCursor
@@ -43,6 +45,7 @@ from gui.config_store import (
     load_node_pool,
     save_group_nodes_config,
 )
+from gui.loading_overlay import LoadingOverlay
 from gui.auto_selector_store import (
     get_selected_node_for_group,
     load_runtime_selected_nodes,
@@ -91,7 +94,10 @@ class DelayTestWorker(QObject):
     finished = Signal(dict)
 
     def run(self):
-        self.finished.emit(test_all_node_delays_via_main_controller())
+        try:
+            self.finished.emit(test_all_node_delays_via_main_controller())
+        except Exception as exc:
+            self.finished.emit({"ok": False, "error": str(exc), "results": {}})
 
 
 class ProxyActionWorker(QObject):
@@ -102,11 +108,51 @@ class ProxyActionWorker(QObject):
         self.action = action
 
     def run(self):
-        if self.action == "start":
-            ok, error = start_proxy_process()
-        else:
-            ok, error = stop_proxy_process()
-        self.finished.emit(self.action, ok, error or "")
+        try:
+            if self.action == "start":
+                ok, error = start_proxy_process()
+                if ok and load_app_settings().get("ui", {}).get("enable_system_proxy_on_start", True):
+                    proxy_settings = load_app_settings().get("proxy", {})
+                    host = str(proxy_settings.get("listen_host") or "127.0.0.1")
+                    try:
+                        port = int(proxy_settings.get("listen_port") or 18000)
+                    except (TypeError, ValueError):
+                        port = 18000
+                    proxy_ok, proxy_message = enable_system_proxy(host, port)
+                    if not proxy_ok:
+                        stop_proxy_process()
+                        ok = False
+                        error = proxy_message or "系统代理启用失败"
+            else:
+                if load_app_settings().get("ui", {}).get("disable_system_proxy_on_stop", True):
+                    proxy_settings = load_app_settings().get("proxy", {})
+                    host = str(proxy_settings.get("listen_host") or "127.0.0.1")
+                    try:
+                        port = int(proxy_settings.get("listen_port") or 18000)
+                    except (TypeError, ValueError):
+                        port = 18000
+                    proxy_ok, proxy_message = disable_system_proxy_if_contextproxy(host, port)
+                    if not proxy_ok:
+                        self.finished.emit(self.action, False, proxy_message or "系统代理关闭失败")
+                        return
+                ok, error = stop_proxy_process()
+            self.finished.emit(self.action, ok, error or "")
+        except Exception as exc:
+            self.finished.emit(self.action, False, str(exc))
+
+
+class GuiTaskWorker(QObject):
+    finished = Signal(bool, object, str)
+
+    def __init__(self, task_func):
+        super().__init__()
+        self.task_func = task_func
+
+    def run(self):
+        try:
+            self.finished.emit(True, self.task_func(), "")
+        except Exception as exc:
+            self.finished.emit(False, None, str(exc))
 
 
 class MainWindow(QMainWindow):
@@ -133,6 +179,16 @@ class MainWindow(QMainWindow):
         self.delay_test_worker = None
         self.proxy_action_thread = None
         self.proxy_action_worker = None
+        self.loading_overlay = None
+        self.busy = False
+        self.current_task_name = None
+        self._busy_started_at = 0.0
+        self.gui_task_thread = None
+        self.gui_task_worker = None
+        self.gui_task_on_success = None
+        self.gui_task_on_error = None
+        self.gui_task_success_message = None
+        self.gui_task_error_message = None
         self.group_nodes_config = {"groups": {}}
         self.node_pool_nodes = {}
         self._active_notifications = []
@@ -180,6 +236,7 @@ class MainWindow(QMainWindow):
         )
 
         self._build_layout()
+        self.loading_overlay = LoadingOverlay(self)
         self._setup_tray_icon()
         self.activity_signal.connect(self._append_activity_log)
         set_activity_callback(lambda message, level: self.activity_signal.emit(message, level))
@@ -192,6 +249,97 @@ class MainWindow(QMainWindow):
 
     def _project_root(self) -> Path:
         return PROJECT_ROOT
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if self.loading_overlay and self.loading_overlay.isVisible():
+            self.loading_overlay.setGeometry(self.rect())
+
+    def start_busy(self, message="正在处理...", task_name: str | None = None):
+        self.busy = True
+        self.current_task_name = task_name or message
+        self._busy_started_at = time.monotonic()
+        if self.loading_overlay:
+            self.loading_overlay.setGeometry(self.rect())
+            self.loading_overlay.start(message)
+
+    def finish_busy(self, success=True, message=None):
+        self.busy = False
+        self.current_task_name = None
+        if self.loading_overlay:
+            self.loading_overlay.stop()
+
+        if message:
+            if success:
+                self.notify_success(message)
+            else:
+                self.notify_error(message)
+
+    def run_gui_task(
+        self,
+        task_func,
+        on_success=None,
+        on_error=None,
+        success_message=None,
+        error_message=None,
+        loading_message="正在处理...",
+        task_name=None,
+    ):
+        if self.busy:
+            self.notify_info("任务处理中，请稍候")
+            return False
+
+        self.start_busy(loading_message, task_name or loading_message)
+        self.gui_task_thread = QThread(self)
+        self.gui_task_worker = GuiTaskWorker(task_func)
+        self.gui_task_on_success = on_success
+        self.gui_task_on_error = on_error
+        self.gui_task_success_message = success_message
+        self.gui_task_error_message = error_message
+
+        self.gui_task_worker.moveToThread(self.gui_task_thread)
+        self.gui_task_thread.started.connect(self.gui_task_worker.run)
+        self.gui_task_worker.finished.connect(self._on_gui_task_finished)
+        self.gui_task_worker.finished.connect(self.gui_task_thread.quit)
+        self.gui_task_worker.finished.connect(self.gui_task_worker.deleteLater)
+        self.gui_task_thread.finished.connect(self.gui_task_thread.deleteLater)
+        self.gui_task_thread.finished.connect(self._cleanup_gui_task_thread)
+        self.gui_task_thread.start()
+        return True
+
+    def _on_gui_task_finished(self, ok: bool, result, error: str):
+        elapsed_ms = int((time.monotonic() - self._busy_started_at) * 1000)
+        delay_ms = max(0, 200 - elapsed_ms)
+        QTimer.singleShot(delay_ms, lambda: self._complete_gui_task(ok, result, error))
+
+    def _complete_gui_task(self, ok: bool, result, error: str):
+        try:
+            if ok:
+                self.finish_busy(True)
+                if self.gui_task_on_success:
+                    self.gui_task_on_success(result)
+                if self.gui_task_success_message:
+                    self.notify_success(self.gui_task_success_message)
+                return
+
+            message = self.gui_task_error_message or "任务执行失败"
+            if error:
+                message = f"{message}：{error}"
+            self.finish_busy(False)
+            if self.gui_task_on_error:
+                self.gui_task_on_error(error)
+            self.notify_error(message)
+        except Exception as exc:
+            self.finish_busy(False, f"任务完成处理失败：{exc}")
+        finally:
+            self.gui_task_on_success = None
+            self.gui_task_on_error = None
+            self.gui_task_success_message = None
+            self.gui_task_error_message = None
+
+    def _cleanup_gui_task_thread(self):
+        self.gui_task_thread = None
+        self.gui_task_worker = None
 
     def _apply_startup_ui_settings(self):
         ui_settings = load_app_settings().get("ui", {})
@@ -524,6 +672,8 @@ class MainWindow(QMainWindow):
             self.proxy_switch_label.setText("代理运行中" if running else "代理已停止")
 
     def _toggle_proxy_from_switch(self):
+        if self.busy:
+            return
         if is_proxy_starting() or get_proxy_state() == "stopping":
             return
 
@@ -533,7 +683,7 @@ class MainWindow(QMainWindow):
             self._start_proxy_from_gui()
 
     def _start_proxy_from_gui(self):
-        if self.proxy_action_thread:
+        if self.proxy_action_thread or self.busy:
             return
 
         if self.proxy_switch:
@@ -543,20 +693,19 @@ class MainWindow(QMainWindow):
             self._update_proxy_switch(False, enabled=True)
             return
 
+        self.start_busy("正在启动代理...", "启动代理")
         self._set_proxy_starting_status()
         self._append_activity_log("\u4ee3\u7406\u542f\u52a8\u4e2d")
         self._run_proxy_action("start")
 
     def _stop_proxy_from_gui(self):
-        if self.proxy_action_thread:
+        if self.proxy_action_thread or self.busy:
             return
 
+        self.start_busy("正在停止代理...", "停止代理")
         if self.proxy_switch:
             self.proxy_switch.setEnabled(False)
         self._append_activity_log("\u4ee3\u7406\u505c\u6b62\u4e2d")
-        if not self._disable_system_proxy_if_configured():
-            self._update_proxy_switch(True, enabled=True)
-            return
 
         self._run_proxy_action("stop")
 
@@ -580,14 +729,13 @@ class MainWindow(QMainWindow):
                 self.refresh_dashboard()
                 self._update_tray_status()
                 self._update_proxy_switch(False, enabled=True)
-                self.notify_error(error or "代理启动失败")
+                self.finish_busy(False, error or "代理启动失败")
                 return
 
             self._residue_cleanup_done = False
             self._set_proxy_status(True)
-            self.notify_success("代理已启动")
-            if self._enable_system_proxy_if_configured():
-                self._append_activity_log("后端服务：内置运行中")
+            self.finish_busy(True, "代理已启动")
+            self._append_activity_log("后端服务：内置运行中")
             QTimer.singleShot(1500, self._append_mihomo_process_count)
             return
 
@@ -595,11 +743,11 @@ class MainWindow(QMainWindow):
             self.refresh_dashboard()
             self._update_tray_status()
             self._update_proxy_switch(True, enabled=True)
-            self.notify_error(error or "代理停止失败")
+            self.finish_busy(False, error or "代理停止失败")
             return
 
         self._set_proxy_status(False)
-        self.notify_success("代理已停止")
+        self.finish_busy(True, "代理已停止")
 
     def _cleanup_proxy_action_thread(self):
         self.proxy_action_thread = None
@@ -797,6 +945,10 @@ class MainWindow(QMainWindow):
         self._update_tray_status()
 
     def _quit_from_tray(self):
+        if self.busy:
+            self.notify_info("任务处理中，请稍候")
+            return
+
         self._force_real_close = True
 
         if is_proxy_running():
@@ -938,34 +1090,60 @@ class MainWindow(QMainWindow):
         return item.text().strip() if item else ""
 
     def _update_subscription_from_inputs(self):
+        if self.busy:
+            return
         name = self.subscription_name_input.text().strip() if self.subscription_name_input else ""
         url = self.subscription_url_input.text().strip() if self.subscription_url_input else ""
 
-        ok, error = update_subscription_from_gui(name, url)
-        if not ok:
-            self.notify_error(f"订阅更新失败：{error}")
-            return
+        def task():
+            ok, error = update_subscription_from_gui(name, url)
+            if not ok:
+                raise RuntimeError(error or "未知错误")
+            return name
 
-        self._refresh_subscription_table()
-        self._refresh_node_pool_table()
-        self.refresh_group_management_page()
-        self.refresh_dashboard()
-        self.notify_success(f"订阅更新成功：{name}")
+        def on_success(result_name):
+            self._refresh_subscription_table()
+            self._refresh_node_pool_table()
+            self.refresh_group_management_page()
+            self.refresh_dashboard()
+            self.notify_success(f"订阅更新成功：{result_name}")
+
+        self.run_gui_task(
+            task,
+            on_success=on_success,
+            error_message="订阅更新失败",
+            loading_message="正在更新订阅...",
+            task_name="更新订阅",
+        )
 
     def _delete_selected_subscription(self):
-        name = self._selected_subscription_name()
-        ok, error, messages = delete_subscription_from_gui(name)
-        if not ok:
-            self.notify_error(f"删除订阅失败：{error}")
+        if self.busy:
             return
+        name = self._selected_subscription_name()
 
-        self._refresh_subscription_table()
-        self._refresh_node_pool_table()
-        self.refresh_group_management_page()
-        self.refresh_dashboard()
-        self.notify_success(f"订阅已删除，节点池和配置已同步：{name}")
-        for message in messages:
-            self._append_activity_log(message)
+        def task():
+            ok, error, messages = delete_subscription_from_gui(name)
+            if not ok:
+                raise RuntimeError(error or "未知错误")
+            return name, messages
+
+        def on_success(result):
+            result_name, messages = result
+            self._refresh_subscription_table()
+            self._refresh_node_pool_table()
+            self.refresh_group_management_page()
+            self.refresh_dashboard()
+            self.notify_success(f"订阅已删除，节点池和配置已同步：{result_name}")
+            for message in messages:
+                self._append_activity_log(message)
+
+        self.run_gui_task(
+            task,
+            on_success=on_success,
+            error_message="删除订阅失败",
+            loading_message="正在删除订阅...",
+            task_name="删除订阅",
+        )
 
     def _node_pool_page(self):
         page, layout = self._page_shell(
@@ -1693,6 +1871,8 @@ class MainWindow(QMainWindow):
         return True, None, port, controller, []
 
     def _save_current_group_nodes(self):
+        if self.busy:
+            return
         if is_proxy_running():
             self._append_activity_log("[WARN] 代理运行中，无法修改分组配置")
             self._update_group_edit_state()
@@ -1713,35 +1893,55 @@ class MainWindow(QMainWindow):
             self.notify_warning(validation_error or "端口校验失败")
             return
 
-        group_data["nodes"] = self._checked_group_nodes()
-        group_data["port"] = port
-        group_data["controller"] = controller
+        config_to_save = copy.deepcopy(self.group_nodes_config)
+        save_groups = config_to_save.get("groups", {})
+        save_group_data = save_groups.get(self.current_group_name)
+        if not isinstance(save_group_data, dict):
+            self.notify_warning("当前分组不存在")
+            return
+        checked_nodes = self._checked_group_nodes()
+        save_group_data["nodes"] = checked_nodes
+        save_group_data["port"] = port
+        save_group_data["controller"] = controller
+        current_group_name = self.current_group_name
         _ = adjusted_ports
 
-        ok, error = save_group_nodes_config(self.group_nodes_config)
-        if not ok:
-            self.notify_error(f"保存失败：{error}")
-            return
+        def task():
+            ok, error = save_group_nodes_config(config_to_save)
+            if not ok:
+                raise RuntimeError(error or "保存失败")
 
-        if not self._prepare_mihomo_ports_before_config_generation():
-            return
+            if not is_proxy_running():
+                ok, error, _changes = prepare_mihomo_runtime_ports(write_settings=True, check_system=True)
+                if not ok:
+                    raise RuntimeError(error or "mihomo 端口准备失败")
 
-        generated, generate_error = generate_mihomo_configs()
-        if not generated:
-            self.notify_error(f"配置生成失败：{generate_error}")
-            return
+            generated, generate_error = generate_mihomo_configs()
+            if not generated:
+                raise RuntimeError(generate_error or "配置生成失败")
+            return config_to_save, current_group_name, len(checked_nodes)
 
-        self._show_group(self.current_group_name)
-        self.refresh_dashboard()
-        self._append_activity_log(
-            f"[INFO]  \u5206\u7ec4 {self.current_group_name} \u5df2\u4fdd\u5b58\uff0c\u914d\u7f6e\u5df2\u81ea\u52a8\u751f\u6210\uff0c\u8282\u70b9\u6570 {len(group_data['nodes'])}"
-        )
-        if is_proxy_running():
-            self.notify_success("配置已保存，部分变更需要重启代理后生效")
-        else:
+        def on_success(result):
+            saved_config, group_name, node_count = result
+            self.group_nodes_config = saved_config
+            self._show_group(group_name)
+            self.refresh_dashboard()
+            self._append_activity_log(
+                f"[INFO]  分组 {group_name} 已保存，配置已自动生成，节点数 {node_count}"
+            )
             self.notify_success("分组已保存，配置已自动生成")
 
+        self.run_gui_task(
+            task,
+            on_success=on_success,
+            error_message="分组保存失败",
+            loading_message="正在保存分组...",
+            task_name="保存分组",
+        )
+
     def _create_group_from_dialog(self):
+        if self.busy:
+            return
         if is_proxy_running():
             self._append_activity_log("[WARN] 代理运行中，无法修改分组配置")
             self._update_group_edit_state()
@@ -1779,36 +1979,47 @@ class MainWindow(QMainWindow):
             self.notify_error(str(exc))
             return
 
-        if "groups" not in self.group_nodes_config or not isinstance(self.group_nodes_config["groups"], dict):
-            self.group_nodes_config["groups"] = {}
+        config_to_save = copy.deepcopy(self.group_nodes_config)
+        if "groups" not in config_to_save or not isinstance(config_to_save["groups"], dict):
+            config_to_save["groups"] = {}
 
-        self.group_nodes_config["groups"][group_name] = {
+        config_to_save["groups"][group_name] = {
             "port": port,
             "controller": controller,
             "nodes": [],
         }
 
-        ok, error = save_group_nodes_config(self.group_nodes_config)
-        if not ok:
-            self.notify_error(f"创建失败：{error}")
-            return
+        def task():
+            ok, error = save_group_nodes_config(config_to_save)
+            if not ok:
+                raise RuntimeError(error or "创建失败")
 
-        if not self._prepare_mihomo_ports_before_config_generation():
-            return
+            ok, error, _changes = prepare_mihomo_runtime_ports(write_settings=True, check_system=True)
+            if not ok:
+                raise RuntimeError(error or "mihomo 端口准备失败")
 
-        generated, generate_error = generate_mihomo_configs()
-        if not generated:
-            self.notify_error(f"分组已创建，但配置生成失败：{generate_error}")
-            return
+            generated, generate_error = generate_mihomo_configs()
+            if not generated:
+                raise RuntimeError(generate_error or "配置生成失败")
+            return config_to_save
 
-        self._refresh_after_group_structure_changed(group_name)
-        self._append_activity_log(f"[INFO]  \u5206\u7ec4 {group_name} \u5df2\u521b\u5efa\uff0cport={port}, controller={controller}")
-        if is_proxy_running():
-            self.notify_success("分组已创建，配置已保存，重启代理后生效")
-        else:
+        def on_success(saved_config):
+            self.group_nodes_config = saved_config
+            self._refresh_after_group_structure_changed(group_name)
+            self._append_activity_log(f"[INFO]  分组 {group_name} 已创建，port={port}, controller={controller}")
             self.notify_success("分组已创建，请勾选节点后保存并应用")
 
+        self.run_gui_task(
+            task,
+            on_success=on_success,
+            error_message="创建分组失败",
+            loading_message="正在创建分组...",
+            task_name="创建分组",
+        )
+
     def _delete_current_group(self):
+        if self.busy:
+            return
         if is_proxy_running():
             self._append_activity_log("[WARN] 代理运行中，无法修改分组配置")
             self._update_group_edit_state()
@@ -1834,30 +2045,45 @@ class MainWindow(QMainWindow):
             return
 
         group_name = self.current_group_name
-        groups = self._group_map()
+        config_to_save = copy.deepcopy(self.group_nodes_config)
+        groups = config_to_save.get("groups", {})
         if group_name not in groups:
             self.notify_warning("当前分组不存在")
             return
 
         groups.pop(group_name, None)
-        ok, error = save_group_nodes_config(self.group_nodes_config)
-        if not ok:
-            self.notify_error(f"删除失败：{error}")
-            return
 
-        if not self._prepare_mihomo_ports_before_config_generation():
-            return
+        def task():
+            ok, error = save_group_nodes_config(config_to_save)
+            if not ok:
+                raise RuntimeError(error or "删除失败")
 
-        generated, generate_error = generate_mihomo_configs()
-        if not generated:
-            self.notify_error(f"分组已删除，但配置生成失败：{generate_error}")
-            return
+            ok, error, _changes = prepare_mihomo_runtime_ports(write_settings=True, check_system=True)
+            if not ok:
+                raise RuntimeError(error or "mihomo 端口准备失败")
 
-        self._refresh_after_group_structure_changed(None)
-        self._append_activity_log(f"[INFO]  \u5206\u7ec4 {group_name} \u5df2\u5220\u9664")
-        self.notify_success("分组已删除。如有该分组相关规则，请到规则管理中清理。")
+            generated, generate_error = generate_mihomo_configs()
+            if not generated:
+                raise RuntimeError(generate_error or "配置生成失败")
+            return config_to_save
+
+        def on_success(saved_config):
+            self.group_nodes_config = saved_config
+            self._refresh_after_group_structure_changed(None)
+            self._append_activity_log(f"[INFO]  分组 {group_name} 已删除")
+            self.notify_success("分组已删除。如有该分组相关规则，请到规则管理中清理。")
+
+        self.run_gui_task(
+            task,
+            on_success=on_success,
+            error_message="删除分组失败",
+            loading_message="正在删除分组...",
+            task_name="删除分组",
+        )
 
     def _reselect_current_group(self):
+        if self.busy:
+            return
         if not self.current_group_name:
             self.notify_info("请先选择一个分组")
             return
@@ -1871,29 +2097,31 @@ class MainWindow(QMainWindow):
         previous_node = self.current_node_input.text().strip() if self.current_node_input else ""
         self._append_activity_log(f"[INFO] {group_name} 开始重新自动选择")
 
-        try:
+        def task():
             from backend.auto_selector import select_best_node_for_group
 
             selected_node = select_best_node_for_group(group_name)
-        except Exception as exc:
-            self.notify_error(f"重新自动选择失败：{exc}")
-            return
-
-        if not selected_node:
-            self.notify_warning("没有可用节点，保持当前选择")
-            self.refresh_selected_node_display(group_name)
-            return
-
-        self.refresh_selected_node_display(group_name)
-        if selected_node != previous_node:
-            try:
+            if selected_node and selected_node != previous_node:
                 from backend.connection_closer import close_changed_groups
 
                 close_changed_groups({group_name})
-            except Exception as exc:
-                self._append_activity_log(f"[WARN] {group_name} 关闭旧连接失败：{exc}")
+            return selected_node
 
-        self._append_activity_log(f"[INFO] {group_name} 当前选择节点：{selected_node}")
+        def on_success(selected_node):
+            self.refresh_selected_node_display(group_name)
+            if not selected_node:
+                self.notify_warning("没有可用节点，保持当前选择")
+                return
+            self._append_activity_log(f"[INFO] {group_name} 当前选择节点：{selected_node}")
+            self.notify_success("已重新自动选择")
+
+        self.run_gui_task(
+            task,
+            on_success=on_success,
+            error_message="重新自动选择失败",
+            loading_message="正在重新选择节点...",
+            task_name="重新自动选择",
+        )
 
     def _rules_page(self):
         page, layout = self._page_shell(
@@ -2233,42 +2461,62 @@ class MainWindow(QMainWindow):
         return result == QMessageBox.Yes
 
     def _save_domain_rules(self):
+        if self.busy:
+            return
         rules = self._rules_from_table(self.domain_rule_table)
         if not self._confirm_missing_groups(rules):
             return
 
-        try:
+        def task():
             save_domain_rules(rules)
             changed_groups, changed_patterns = self._reload_domain_rules_immediately()
-        except Exception as exc:
-            self.notify_error(f"域名规则保存失败：{exc}")
-            return
+            return changed_groups, changed_patterns
 
-        self._fill_simple_rule_table(self.domain_rule_table, load_domain_rules())
-        self._append_activity_log(
-            f"[INFO] 域名规则已保存，已立即断开受影响连接，"
-            f"groups={sorted(changed_groups)}, patterns={sorted(changed_patterns)}"
+        def on_success(result):
+            changed_groups, changed_patterns = result
+            self._fill_simple_rule_table(self.domain_rule_table, load_domain_rules())
+            self._append_activity_log(
+                f"[INFO] 域名规则已保存，已立即断开受影响连接，"
+                f"groups={sorted(changed_groups)}, patterns={sorted(changed_patterns)}"
+            )
+            self.notify_success("域名规则已保存")
+
+        self.run_gui_task(
+            task,
+            on_success=on_success,
+            error_message="域名规则保存失败",
+            loading_message="正在保存规则...",
+            task_name="保存域名规则",
         )
-        self.notify_success("域名规则已保存")
 
     def _save_process_rules(self):
+        if self.busy:
+            return
         rules = self._rules_from_table(self.process_rule_table)
         if not self._confirm_missing_groups(rules):
             return
 
-        try:
+        def task():
             save_process_rules(rules)
             changed_groups, changed_patterns = self._reload_process_rules_immediately()
-        except Exception as exc:
-            self.notify_error(f"进程规则保存失败：{exc}")
-            return
+            return changed_groups, changed_patterns
 
-        self._fill_simple_rule_table(self.process_rule_table, load_process_rules())
-        self._append_activity_log(
-            f"[INFO] 进程规则已保存，已立即断开受影响连接，"
-            f"groups={sorted(changed_groups)}, processes={sorted(changed_patterns)}"
+        def on_success(result):
+            changed_groups, changed_patterns = result
+            self._fill_simple_rule_table(self.process_rule_table, load_process_rules())
+            self._append_activity_log(
+                f"[INFO] 进程规则已保存，已立即断开受影响连接，"
+                f"groups={sorted(changed_groups)}, processes={sorted(changed_patterns)}"
+            )
+            self.notify_success("进程规则已保存")
+
+        self.run_gui_task(
+            task,
+            on_success=on_success,
+            error_message="进程规则保存失败",
+            loading_message="正在保存规则...",
+            task_name="保存进程规则",
         )
-        self.notify_success("进程规则已保存")
 
     def _reload_domain_rules_immediately(self) -> tuple[set[str], set[str]]:
         try:
@@ -2277,7 +2525,7 @@ class MainWindow(QMainWindow):
             changed_groups, changed_patterns = reload_domain_file_now()
             return set(changed_groups or set()), set(changed_patterns or set())
         except Exception as exc:
-            self._append_activity_log(f"[WARN] 域名规则即时重载失败：{exc}")
+            _ = exc
             return set(), set()
 
     def _reload_process_rules_immediately(self) -> tuple[set[str], set[str]]:
@@ -2287,7 +2535,7 @@ class MainWindow(QMainWindow):
             changed_groups, changed_patterns = reload_app_process_file_now()
             return set(changed_groups or set()), set(changed_patterns or set())
         except Exception as exc:
-            self._append_activity_log(f"[WARN] 进程规则即时重载失败：{exc}")
+            _ = exc
             return set(), set()
 
 
@@ -2399,6 +2647,8 @@ class MainWindow(QMainWindow):
         return int(value)
 
     def _save_app_settings_from_inputs(self):
+        if self.busy:
+            return
         previous_settings = load_app_settings()
         listen_port = self._read_int_setting("proxy.listen_port", "\u672c\u5730\u4ee3\u7406\u7aef\u53e3")
         receiver_port = self._read_int_setting("proxy.receiver_port", "Tab \u4e0a\u62a5\u63a5\u6536\u7aef\u53e3")
@@ -2432,19 +2682,29 @@ class MainWindow(QMainWindow):
             "logging": previous_settings.get("logging", {}),
         }
 
-        ok, error = save_app_settings(settings)
-        if not ok:
-            self.notify_error(f"保存失败：{error}")
-            return
-
-        self._max_recent_activities = int(
-            load_app_settings().get("logging", {}).get("max_recent_activities") or 200
-        )
-
         message = "设置已保存"
         if self._settings_need_proxy_restart(previous_settings, settings):
             message += "，部分设置需要重启代理后生效"
-        self.notify_success(message)
+
+        def task():
+            ok, error = save_app_settings(settings)
+            if not ok:
+                raise RuntimeError(error or "保存失败")
+            return message
+
+        def on_success(success_message):
+            self._max_recent_activities = int(
+                load_app_settings().get("logging", {}).get("max_recent_activities") or 200
+            )
+            self.notify_success(success_message)
+
+        self.run_gui_task(
+            task,
+            on_success=on_success,
+            error_message="设置保存失败",
+            loading_message="正在保存设置...",
+            task_name="保存设置",
+        )
 
     def _settings_need_proxy_restart(self, previous_settings: dict, current_settings: dict) -> bool:
         watched_keys = [
@@ -2513,6 +2773,8 @@ class MainWindow(QMainWindow):
 
 
     def _start_node_delay_test(self):
+        if self.busy:
+            return
         if self.delay_test_thread and self.delay_test_thread.isRunning():
             cancel_delay_test()
             if self.node_delay_test_button:
@@ -2521,6 +2783,7 @@ class MainWindow(QMainWindow):
             self.notify_info("节点池延迟测试正在取消")
             return
 
+        self.start_busy("正在测试延迟...", "节点池测试延迟")
         if self.node_delay_test_button:
             self.node_delay_test_button.setEnabled(True)
             self.node_delay_test_button.setText("取消测速")
@@ -2546,7 +2809,7 @@ class MainWindow(QMainWindow):
         if not isinstance(result, dict) or not result.get("ok"):
             error = result.get("error") if isinstance(result, dict) else None
             error_text = error or "\u672a\u77e5\u9519\u8bef"
-            self.notify_warning(f"\u8282\u70b9\u6c60\u5ef6\u8fdf\u6d4b\u8bd5\u5931\u8d25\uff1a{error_text}")
+            self.finish_busy(False, f"\u8282\u70b9\u6c60\u5ef6\u8fdf\u6d4b\u8bd5\u5931\u8d25\uff1a{error_text}")
             return
 
         results = result.get("results", {})
@@ -2563,15 +2826,21 @@ class MainWindow(QMainWindow):
             self._populate_group_node_table(set(self._current_group_nodes(self.current_group_name)))
 
         if result.get("cancelled"):
+            self.finish_busy(True)
             self.notify_info(f"节点池延迟测试已取消：已完成 {total_count} 个，{ok_count} 个可用")
         else:
-            self.notify_success(f"\u8282\u70b9\u6c60\u5ef6\u8fdf\u6d4b\u8bd5\u5b8c\u6210\uff1a{ok_count}/{total_count} \u53ef\u7528")
+            self.finish_busy(True, f"\u8282\u70b9\u6c60\u5ef6\u8fdf\u6d4b\u8bd5\u5b8c\u6210\uff1a{ok_count}/{total_count} \u53ef\u7528")
 
     def _cleanup_node_delay_thread(self):
         self.delay_test_thread = None
         self.delay_test_worker = None
 
     def closeEvent(self, event):
+        if self.busy:
+            event.ignore()
+            self.notify_info("任务处理中，请稍候")
+            return
+
         if self._force_real_close:
             self._disable_system_proxy_on_exit()
             if is_proxy_running() or get_proxy_state() in {"starting", "stopping", "failed"}:
