@@ -1,0 +1,172 @@
+import os
+import subprocess
+from pathlib import Path
+
+from backend.config import MIHOMO_DIR
+from backend.mihomo_config_generator import generate_all_configs
+from backend.mihomo_paths import get_mihomo_exe_path, mihomo_exe_missing_message
+from backend.port_manager import prepare_mihomo_runtime_ports
+
+
+mihomo_process: subprocess.Popen | None = None
+MAIN_CONFIG_FILE = Path(MIHOMO_DIR) / "config.yaml"
+
+
+def get_exe_path() -> str:
+    return str(get_mihomo_exe_path())
+
+
+def get_main_config_file() -> str:
+    return str(MAIN_CONFIG_FILE)
+
+
+def is_process_running(process: subprocess.Popen | None) -> bool:
+    return process is not None and process.poll() is None
+
+
+def _force_kill_process(process: subprocess.Popen):
+    if not is_process_running(process):
+        return
+
+    try:
+        if os.name == "nt":
+            subprocess.run(
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+        else:
+            process.kill()
+        process.wait(timeout=3)
+    except Exception as exc:
+        print(f"[mihomo] force kill failed pid={process.pid}: {exc}")
+
+
+def _is_main_config_command(command_line: str) -> bool:
+    command_line = command_line.lower()
+    config_name = str(MAIN_CONFIG_FILE).lower()
+    return "mihomo" in command_line and "config.yaml" in command_line and config_name in command_line
+
+
+def _find_existing_main_mihomo_pids() -> list[int]:
+    if os.name != "nt":
+        return []
+
+    try:
+        import psutil
+    except ImportError:
+        return []
+
+    pids = []
+    for process in psutil.process_iter(["pid", "name", "cmdline"]):
+        try:
+            name = (process.info.get("name") or "").lower()
+            if "mihomo" not in name:
+                continue
+            cmdline = " ".join(process.info.get("cmdline") or [])
+            if _is_main_config_command(cmdline):
+                pids.append(int(process.info["pid"]))
+        except Exception:
+            continue
+    return pids
+
+
+def _cleanup_recorded_process_if_exited():
+    global mihomo_process
+    if mihomo_process is not None and mihomo_process.poll() is not None:
+        print(f"[mihomo] recorded process already exited, pid={mihomo_process.pid}")
+        mihomo_process = None
+
+
+def launch_mihomo_all():
+    global mihomo_process
+
+    _cleanup_recorded_process_if_exited()
+    if is_process_running(mihomo_process):
+        print(f"[mihomo] single core already running, pid={mihomo_process.pid}")
+        return mihomo_process
+
+    existing_pids = _find_existing_main_mihomo_pids()
+    if existing_pids:
+        print(f"[mihomo] single core already exists, pids={existing_pids}; skip duplicate launch")
+        return None
+
+    ok, error, changes = prepare_mihomo_runtime_ports(write_settings=True, check_system=True)
+    if not ok:
+        raise RuntimeError(error or "mihomo runtime port check failed")
+    for change in changes:
+        print(f"[mihomo] runtime port adjusted: {change}")
+
+    generate_all_configs()
+
+    exe_path = get_exe_path()
+    config_file = get_main_config_file()
+
+    if not os.path.isfile(exe_path):
+        raise FileNotFoundError(mihomo_exe_missing_message(exe_path))
+
+    if not os.path.isfile(config_file):
+        raise FileNotFoundError(f"mihomo config not found: {config_file}")
+
+    creationflags = 0
+    if os.name == "nt":
+        creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
+
+    print(f"[mihomo] launch single core: {exe_path} -f {config_file}")
+    mihomo_process = subprocess.Popen(
+        [exe_path, "-f", config_file],
+        cwd=MIHOMO_DIR,
+        creationflags=creationflags,
+    )
+
+    print(f"[mihomo] single core started, pid={mihomo_process.pid}, config={config_file}")
+    return mihomo_process
+
+
+def stop_all_mihomo():
+    global mihomo_process
+
+    process = mihomo_process
+    if is_process_running(process):
+        print(f"[mihomo] stopping single core, pid={process.pid}")
+        try:
+            process.terminate()
+            process.wait(timeout=2)
+        except Exception:
+            _force_kill_process(process)
+
+        if process.poll() is None:
+            _force_kill_process(process)
+
+        print("[mihomo] single core stopped")
+
+    mihomo_process = None
+    _stop_residual_main_config_processes()
+
+
+def _stop_residual_main_config_processes():
+    if os.name != "nt":
+        return
+
+    config_path = str(MAIN_CONFIG_FILE)
+    try:
+        subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                (
+                    f"$config = '{config_path}'; "
+                    "Get-CimInstance Win32_Process | "
+                    "Where-Object { $_.Name -like 'mihomo*' -and "
+                    "$_.CommandLine -like \"*$config*\" } | "
+                    "ForEach-Object { Stop-Process -Id $_.ProcessId -Force }"
+                ),
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    except Exception:
+        pass
