@@ -18,7 +18,7 @@ def get_default_app_settings() -> dict:
             "check_interval": 20,
             "max_fail_count": 2,
             "delay_timeout_ms": 5000,
-            "test_url": "https://cp.cloudflare.com/generate_204",
+            "test_url": "http://www.gstatic.com/generate_204",
         },
         "mihomo": {
             "exe": "",
@@ -31,6 +31,11 @@ def get_default_app_settings() -> dict:
             "auto_start_proxy": False,
             "enable_system_proxy_on_start": True,
             "disable_system_proxy_on_stop": True,
+        },
+        "logging": {
+            "console_enabled": False,
+            "debug_enabled": False,
+            "max_recent_activities": 200,
         },
     }
 
@@ -125,6 +130,22 @@ def load_app_settings() -> dict:
     if isinstance(ui, dict):
         for key, default_value in defaults["ui"].items():
             settings["ui"][key] = _to_bool(ui.get(key), default_value)
+
+    logging_settings = raw.get("logging", {})
+    if isinstance(logging_settings, dict):
+        settings["logging"]["console_enabled"] = _to_bool(
+            logging_settings.get("console_enabled"),
+            defaults["logging"]["console_enabled"],
+        )
+        settings["logging"]["debug_enabled"] = _to_bool(
+            logging_settings.get("debug_enabled"),
+            defaults["logging"]["debug_enabled"],
+        )
+        settings["logging"]["max_recent_activities"] = _to_int(
+            logging_settings.get("max_recent_activities"),
+            defaults["logging"]["max_recent_activities"],
+            1,
+        )
 
     return settings
 

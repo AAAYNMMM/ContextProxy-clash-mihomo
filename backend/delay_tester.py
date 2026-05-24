@@ -1,6 +1,6 @@
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 from urllib.parse import quote
 
@@ -14,6 +14,7 @@ from backend.paths import CONFIG_DIR
 NODE_POOL_FILE = CONFIG_DIR / "node_pool.yaml"
 MAX_WORKERS = 12
 DELAY_TEST_LOCK = threading.Lock()
+DELAY_TEST_CANCEL_EVENT = threading.Event()
 
 
 def _load_yaml(path: Path) -> dict:
@@ -82,14 +83,20 @@ def _node_attempts(node: dict | None = None) -> int:
     return 2 if _is_vless_grpc_reality(node) else 1
 
 
-def test_node_delay_via_main_controller(node_name: str, controller_port: int | None = None, node: dict | None = None) -> dict:
+def test_node_delay_via_main_controller(
+    node_name: str,
+    controller_port: int | None = None,
+    node: dict | None = None,
+    allow_retry: bool = True,
+) -> dict:
     controller_port = controller_port or get_mihomo_controller_port()
     timeout_ms = _node_timeout_ms(node)
     encoded_name = quote(str(node_name), safe="")
     url = _controller_url(controller_port, f"/proxies/{encoded_name}/delay")
     last_error = None
 
-    for attempt in range(_node_attempts(node)):
+    attempts = _node_attempts(node) if allow_retry else 1
+    for attempt in range(attempts):
         try:
             response = local_get(
                 url,
@@ -106,7 +113,7 @@ def test_node_delay_via_main_controller(node_name: str, controller_port: int | N
             }
         except Exception as exc:
             last_error = exc
-            if attempt + 1 < _node_attempts(node):
+            if attempt + 1 < attempts:
                 time.sleep(0.35)
 
     return {
@@ -115,13 +122,20 @@ def test_node_delay_via_main_controller(node_name: str, controller_port: int | N
         "error": str(last_error),
     }
 
-def test_all_node_delays_via_main_controller() -> dict:
+def cancel_delay_test():
+    DELAY_TEST_CANCEL_EVENT.set()
+
+
+def test_all_node_delays_via_main_controller(cancel_event: threading.Event | None = None) -> dict:
     if not DELAY_TEST_LOCK.acquire(blocking=False):
         return {
             "ok": False,
             "error": "delay test is already running",
             "results": {},
         }
+
+    cancel_event = cancel_event or DELAY_TEST_CANCEL_EVENT
+    cancel_event.clear()
 
     try:
         nodes = _load_node_pool()
@@ -147,26 +161,37 @@ def test_all_node_delays_via_main_controller() -> dict:
         ]
 
         results = {}
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            future_map = {
-                executor.submit(test_node_delay_via_main_controller, node_name, controller_port, node): node_name
-                for node_name, node in node_items
-            }
+        executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
+        future_map = {
+            executor.submit(test_node_delay_via_main_controller, node_name, controller_port, node, False): node_name
+            for node_name, node in node_items
+        }
+        pending = set(future_map.keys())
 
-            for future in as_completed(future_map):
-                node_name = future_map[future]
-                try:
-                    results[node_name] = future.result()
-                except Exception as exc:
-                    results[node_name] = {
-                        "delay": None,
-                        "status": "failed",
-                        "error": str(exc),
-                    }
+        try:
+            while pending and not cancel_event.is_set():
+                done, pending = wait(pending, timeout=0.3, return_when=FIRST_COMPLETED)
+                for future in done:
+                    node_name = future_map[future]
+                    try:
+                        results[node_name] = future.result()
+                    except Exception as exc:
+                        results[node_name] = {
+                            "delay": None,
+                            "status": "failed",
+                            "error": str(exc),
+                        }
+
+            if cancel_event.is_set():
+                for future in pending:
+                    future.cancel()
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
 
         return {
             "ok": True,
             "error": None,
+            "cancelled": cancel_event.is_set(),
             "results": results,
         }
     finally:

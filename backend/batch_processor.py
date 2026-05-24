@@ -34,6 +34,11 @@ def get_request_queue():
 REQUEST_GROUP_MAP = {}
 
 DOMAIN_RULES = []
+DOMAIN_RULE_INDEX = {"exact": {}, "suffix": [], "wildcard": []}
+DOMAIN_RULE_VERSION = 0
+DOMAIN_DECISION_CACHE = {}
+DOMAIN_CACHE_TTL = 8.0
+DOMAIN_DIRECT_CACHE_TTL = 3.0
 DOMAIN_FILE_PATH = None
 DOMAIN_FILE_LAST_MODIFY = 0
 DOMAIN_FILE_CHECK_INTERVAL = 5
@@ -54,6 +59,75 @@ def domain_match(host: str, pattern: str) -> bool:
             return True
 
     return False
+
+
+def _is_exact_pattern(pattern: str) -> bool:
+    return not any(char in pattern for char in "*?[]")
+
+
+def _build_domain_rule_index(rules: list[tuple[str, str]]) -> dict:
+    exact = {}
+    suffix = []
+    wildcard = []
+
+    for group, pattern in rules:
+        pattern = pattern.lower().strip()
+        if _is_exact_pattern(pattern):
+            exact.setdefault(pattern, group)
+        elif pattern.startswith("*.") and _is_exact_pattern(pattern[2:]):
+            suffix.append((pattern[2:], group))
+        else:
+            wildcard.append((pattern, group))
+
+    return {
+        "exact": exact,
+        "suffix": suffix,
+        "wildcard": wildcard,
+    }
+
+
+def clear_domain_decision_cache():
+    DOMAIN_DECISION_CACHE.clear()
+
+
+def _cached_domain_decision(tab_host: str, request_host: str):
+    key = (DOMAIN_RULE_VERSION, tab_host, request_host)
+    entry = DOMAIN_DECISION_CACHE.get(key)
+    if not entry:
+        return None
+
+    group, created_at, ttl = entry
+    if time.monotonic() - created_at > ttl:
+        DOMAIN_DECISION_CACHE.pop(key, None)
+        return None
+
+    return group
+
+
+def _store_domain_decision(tab_host: str, request_host: str, group: str):
+    ttl = DOMAIN_DIRECT_CACHE_TTL if group == DIRECT else DOMAIN_CACHE_TTL
+    key = (DOMAIN_RULE_VERSION, tab_host, request_host)
+    DOMAIN_DECISION_CACHE[key] = (group, time.monotonic(), ttl)
+
+
+def _match_domain_rule(host: str) -> str | None:
+    host = host.lower().strip()
+    if not host:
+        return None
+
+    exact_group = DOMAIN_RULE_INDEX.get("exact", {}).get(host)
+    if exact_group:
+        return exact_group
+
+    for suffix_root, group in DOMAIN_RULE_INDEX.get("suffix", []):
+        if host == suffix_root or host.endswith("." + suffix_root):
+            return group
+
+    for pattern, group in DOMAIN_RULE_INDEX.get("wildcard", []):
+        if domain_match(host, pattern):
+            return group
+
+    return None
 
 
 def load_domain_file(path: str):
@@ -156,20 +230,27 @@ def reload_domain_file_now():
 
 
 def _reload_domain_file():
-    global DOMAIN_RULES, DOMAIN_FILE_LAST_MODIFY
+    global DOMAIN_RULES, DOMAIN_RULE_INDEX, DOMAIN_RULE_VERSION, DOMAIN_FILE_LAST_MODIFY
 
     old_rules = DOMAIN_RULES
-    new_rules = _read_domain_rules()
+    try:
+        new_rules = _read_domain_rules()
+    except Exception as exc:
+        write_log("rules", f"domain rules reload failed, keeping old rules: {exc}", "WARN")
+        return set(), set()
 
     changed_groups = _get_changed_groups(old_rules, new_rules)
 
     DOMAIN_RULES = new_rules
+    DOMAIN_RULE_INDEX = _build_domain_rule_index(new_rules)
+    DOMAIN_RULE_VERSION += 1
     DOMAIN_FILE_LAST_MODIFY = DOMAIN_FILE_PATH.stat().st_mtime
 
     REQUEST_GROUP_MAP.clear()
+    clear_domain_decision_cache()
 
     write_log("rules", f"domain rules loaded, count={len(DOMAIN_RULES)}")
-    write_log("rules", "cleared old requestHost group cache")
+    write_log("rules", "cleared old routing caches")
 
     changed_patterns = _get_changed_patterns(old_rules, new_rules)
 
@@ -213,12 +294,15 @@ async def _watch_domain_file():
 
 def decide_group(tabHost: str, requestHost: str):
     tab_host = tabHost.lower().strip()
+    request_host = requestHost.lower().strip()
 
-    for group, pattern in DOMAIN_RULES:
-        if domain_match(tab_host, pattern):
-            return group
+    cached_group = _cached_domain_decision(tab_host, request_host)
+    if cached_group:
+        return cached_group
 
-    return DIRECT
+    group = _match_domain_rule(tab_host) or DIRECT
+    _store_domain_decision(tab_host, request_host, group)
+    return group
 
 
 def resolve_final_group(groups: set[str]):

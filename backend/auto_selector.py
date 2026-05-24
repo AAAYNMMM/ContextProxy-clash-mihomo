@@ -9,6 +9,7 @@ from backend.app_settings import get_auto_select_settings, get_mihomo_controller
 from backend.delay_tester import is_main_controller_available, test_node_delay_via_main_controller
 from backend.local_http import local_put
 from backend.paths import CONFIG_DIR
+from backend.activity_bus import write_log
 
 
 GROUP_NODES_FILE = CONFIG_DIR / "group_nodes.yaml"
@@ -22,6 +23,10 @@ _selected_delays: dict[str, int | None] = {}
 _fail_counts: dict[str, int] = {}
 _monitor_task = None
 _running = False
+
+
+def _log(message: str, level: str = "INFO"):
+    write_log("auto_select", message, level)
 
 
 def _auto_select_settings() -> dict:
@@ -44,7 +49,7 @@ def _load_yaml(path: Path, default):
         with open(path, "r", encoding="utf-8") as file:
             data = yaml.safe_load(file)
     except Exception as exc:
-        print(f"[auto-select] read failed: {path} | {exc}")
+        _log(f"read failed: {path} | {exc}", "WARN")
         return default
 
     return data if data is not None else default
@@ -126,21 +131,21 @@ def start_auto_selector():
     global _monitor_task, _running
 
     if _running:
-        print("[auto-select] already running")
+        _log("already running")
         return
 
     _running = True
     _load_runtime_selected_nodes()
-    select_best_node_for_all_groups()
+    initialize_selected_nodes_without_delay()
 
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
-        print("[auto-select] no running event loop; startup selection only")
+        _log("no running event loop; startup selection only", "WARN")
         return
 
     _monitor_task = loop.create_task(monitor_current_nodes())
-    print("[auto-select] monitor started")
+    _log("monitor started")
 
 
 def stop_auto_selector():
@@ -152,7 +157,7 @@ def stop_auto_selector():
         _monitor_task.cancel()
 
     _monitor_task = None
-    print("[auto-select] stopped")
+    _log("stopped")
 
 
 def select_best_node_for_all_groups():
@@ -165,18 +170,59 @@ def select_best_node_for_all_groups():
         select_best_node_for_group(str(group_name))
 
 
+def initialize_selected_nodes_without_delay():
+    groups = _load_group_nodes()
+    controller_port = get_mihomo_controller_port()
+    controller_available = is_main_controller_available(controller_port)
+    changed = False
+
+    for group_name, group_data in groups.items():
+        group_name = str(group_name)
+        if not isinstance(group_data, dict):
+            continue
+
+        nodes = _group_nodes(group_name)
+        current_node = _selected_nodes.get(group_name)
+
+        if not nodes:
+            if current_node:
+                _selected_nodes.pop(group_name, None)
+                _selected_delays.pop(group_name, None)
+                _fail_counts.pop(group_name, None)
+                changed = True
+            _log(f"{group_name} has no nodes at startup")
+            continue
+
+        if current_node in nodes:
+            selected_node = current_node
+            _log(f"{group_name} keep previous node: {selected_node}")
+        else:
+            selected_node = nodes[0]
+            _selected_nodes[group_name] = selected_node
+            _selected_delays[group_name] = None
+            _fail_counts[group_name] = 0
+            changed = True
+            _log(f"{group_name} use first node: {selected_node}")
+
+        if controller_available:
+            switch_group_node(controller_port, group_name, selected_node)
+
+    if changed:
+        _save_runtime_selected_nodes()
+
+
 def select_best_node_for_group(group_name):
     controller_port = get_mihomo_controller_port()
     if not is_main_controller_available(controller_port):
-        print(f"[auto-select] main controller unavailable, skip group: {group_name}")
+        _log(f"main controller unavailable, skip group: {group_name}", "WARN")
         return None
 
     nodes = _group_nodes(group_name)
     if not nodes:
-        print(f"[auto-select] {group_name} has no nodes, skip")
+        _log(f"{group_name} has no nodes, skip")
         return None
 
-    print(f"[auto-select] {group_name} testing {len(nodes)} nodes")
+    _log(f"{group_name} testing {len(nodes)} nodes")
 
     best_node = None
     best_delay = None
@@ -193,9 +239,9 @@ def select_best_node_for_group(group_name):
     if not best_node:
         current = _selected_nodes.get(group_name)
         if current:
-            print(f"[auto-select] {group_name} no available node, keep current: {current}")
+            _log(f"{group_name} no available node, keep current: {current}", "WARN")
         else:
-            print(f"[auto-select] {group_name} no available node, keep current")
+            _log(f"{group_name} no available node, keep current", "WARN")
         return None
 
     if switch_group_node(controller_port, group_name, best_node):
@@ -203,7 +249,7 @@ def select_best_node_for_group(group_name):
         _selected_delays[group_name] = best_delay
         _fail_counts[group_name] = 0
         _save_runtime_selected_nodes()
-        print(f"[auto-select] {group_name} selected node: {best_node}, delay {best_delay}ms")
+        _log(f"{group_name} selected node: {best_node}, delay {best_delay}ms")
         return best_node
 
     return None
@@ -216,7 +262,7 @@ async def monitor_current_nodes():
         groups = _load_group_nodes()
         controller_port = get_mihomo_controller_port()
         if not is_main_controller_available(controller_port):
-            print("[auto-select] main controller unavailable, skip health check")
+            _log("main controller unavailable, skip health check", "WARN")
             continue
 
         for group_name in groups.keys():
@@ -225,14 +271,21 @@ async def monitor_current_nodes():
             valid_nodes = set(_group_nodes(group_name))
 
             if not current_node or current_node not in valid_nodes:
-                print(f"[auto-select] {group_name} has no current selection, selecting")
-                select_best_node_for_group(group_name)
+                _log(f"{group_name} has no current selection, using first node")
+                nodes = _group_nodes(group_name)
+                if nodes:
+                    selected_node = nodes[0]
+                    _selected_nodes[group_name] = selected_node
+                    _selected_delays[group_name] = None
+                    _fail_counts[group_name] = 0
+                    switch_group_node(controller_port, group_name, selected_node)
+                    _save_runtime_selected_nodes()
                 continue
 
             delay = test_node_delay(controller_port, current_node)
             if delay is not None:
                 _fail_counts[group_name] = 0
-                print(f"[auto-select] {group_name} current node ok: {current_node}")
+                _log(f"{group_name} current node ok: {current_node}", "DEBUG")
                 continue
 
             fail_count = _fail_counts.get(group_name, 0) + 1
@@ -240,10 +293,10 @@ async def monitor_current_nodes():
 
             max_fail_count = _max_fail_count()
             if fail_count < max_fail_count:
-                print(f"[auto-select] {group_name} current node failed {fail_count}/{max_fail_count}: {current_node}")
+                _log(f"{group_name} current node failed {fail_count}/{max_fail_count}: {current_node}", "WARN")
                 continue
 
-            print(f"[auto-select] {group_name} current node failed continuously, reselecting")
+            _log(f"{group_name} current node failed continuously, reselecting", "WARN")
             previous_node = _selected_nodes.get(group_name)
             selected_node = select_best_node_for_group(group_name)
 
@@ -253,7 +306,7 @@ async def monitor_current_nodes():
 
                     close_changed_groups({group_name})
                 except Exception as exc:
-                    print(f"[auto-select] {group_name} close old connections failed: {exc}")
+                    _log(f"{group_name} close old connections failed: {exc}", "WARN")
 
 
 def _delay_from_result(result: dict | None):
@@ -279,14 +332,15 @@ def switch_group_node(controller_port, group_name, node_name):
     try:
         response = local_put(url, json={"name": node_name}, timeout=3)
     except Exception as exc:
-        print(f"[auto-select] {group_name} switch node exception: {exc}")
+        _log(f"{group_name} switch node exception: {exc}", "WARN")
         return False
 
     if response.status_code in (200, 204):
         return True
 
-    print(
-        f"[auto-select] {group_name} switch node failed: "
-        f"status={response.status_code}, body={response.text[:200]}"
+    _log(
+        f"{group_name} switch node failed: "
+        f"status={response.status_code}, body={response.text[:200]}",
+        "WARN",
     )
     return False

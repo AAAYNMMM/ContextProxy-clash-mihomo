@@ -1,15 +1,18 @@
-﻿import asyncio
+import asyncio
+import threading
 import time
 
 import psutil
 
-from backend.config import TCP_LISTEN_PORT
 from backend.activity_bus import write_log
+from backend.config import TCP_LISTEN_PORT
 
 
 PROCESS_PORT_CACHE = {}
 PROCESS_CACHE_TTL = 1.0
+PROCESS_NEGATIVE_CACHE_TTL = 0.75
 PROCESS_CACHE_SCAN_INTERVAL = 1.0
+PROCESS_CACHE_LOCK = threading.RLock()
 
 _process_cache_task = None
 _process_cache_running = False
@@ -54,6 +57,7 @@ def refresh_process_cache_once():
 
             refreshed[make_cache_key(laddr_ip, laddr_port)] = {
                 "process_name": process_name,
+                "negative": False,
                 "updated_at": now,
             }
 
@@ -61,32 +65,54 @@ def refresh_process_cache_once():
         write_log("process_cache", f"refresh failed: {exc}", "WARN")
         return
 
-    PROCESS_PORT_CACHE.update(refreshed)
-    _cleanup_expired_cache(now)
+    with PROCESS_CACHE_LOCK:
+        PROCESS_PORT_CACHE.update(refreshed)
+        _cleanup_expired_cache(now)
 
 
 def _cleanup_expired_cache(now):
     expired_keys = [
         key
         for key, value in PROCESS_PORT_CACHE.items()
-        if now - value.get("updated_at", 0) > PROCESS_CACHE_TTL
+        if now - value.get("updated_at", 0)
+        > (PROCESS_NEGATIVE_CACHE_TTL if value.get("negative") else PROCESS_CACHE_TTL)
     ]
 
     for key in expired_keys:
         PROCESS_PORT_CACHE.pop(key, None)
 
 
-def get_process_name_from_cache(client_ip, client_port):
+def get_process_lookup_from_cache(client_ip, client_port) -> tuple[bool, str | None]:
     key = make_cache_key(client_ip, client_port)
-    entry = PROCESS_PORT_CACHE.get(key)
-    if not entry:
-        return None
+    with PROCESS_CACHE_LOCK:
+        entry = PROCESS_PORT_CACHE.get(key)
+        if not entry:
+            return False, None
 
-    if time.monotonic() - entry.get("updated_at", 0) > PROCESS_CACHE_TTL:
-        PROCESS_PORT_CACHE.pop(key, None)
-        return None
+        ttl = PROCESS_NEGATIVE_CACHE_TTL if entry.get("negative") else PROCESS_CACHE_TTL
+        if time.monotonic() - entry.get("updated_at", 0) > ttl:
+            PROCESS_PORT_CACHE.pop(key, None)
+            return False, None
 
-    return entry.get("process_name")
+        if entry.get("negative"):
+            return True, None
+
+        return True, entry.get("process_name")
+
+
+def get_process_name_from_cache(client_ip, client_port):
+    hit, process_name = get_process_lookup_from_cache(client_ip, client_port)
+    return process_name if hit else None
+
+
+def cache_process_lookup_miss(client_ip, client_port):
+    key = make_cache_key(client_ip, client_port)
+    with PROCESS_CACHE_LOCK:
+        PROCESS_PORT_CACHE[key] = {
+            "process_name": None,
+            "negative": True,
+            "updated_at": time.monotonic(),
+        }
 
 
 async def start_process_cache_watcher():

@@ -1,5 +1,6 @@
 import sys
 import subprocess
+import hashlib
 from datetime import datetime
 from pathlib import Path
 
@@ -289,6 +290,17 @@ def _check_mihomo_config(config_path: Path):
         print("[generator] mihomo config check passed")
 
 
+def _file_sha256(path: Path) -> str | None:
+    if not path.is_file():
+        return None
+
+    digest = hashlib.sha256()
+    with open(path, "rb") as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def check_group_nodes():
     node_pool = load_node_pool()
     groups = load_group_nodes()
@@ -317,6 +329,17 @@ def check_group_nodes():
 def generate_all_configs():
     config = build_mihomo_config()
     save_yaml(TEMP_CONFIG_FILE, config)
+    temp_hash = _file_sha256(TEMP_CONFIG_FILE)
+    current_hash = _file_sha256(MAIN_CONFIG_FILE)
+    if temp_hash and current_hash and temp_hash == current_hash:
+        try:
+            TEMP_CONFIG_FILE.unlink()
+        except Exception:
+            pass
+        _cleanup_old_group_configs()
+        print(f"[generator] config unchanged, skipped mihomo check: {MAIN_CONFIG_FILE}")
+        return {"config.yaml"}
+
     try:
         _check_mihomo_config(TEMP_CONFIG_FILE)
         TEMP_CONFIG_FILE.replace(MAIN_CONFIG_FILE)

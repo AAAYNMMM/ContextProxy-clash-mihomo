@@ -70,10 +70,20 @@ def count_rules() -> int:
     return _count_rule_file(DOMAIN_RULES_FILE) + _count_rule_file(PROCESS_RULES_FILE)
 
 
+def count_active_connections() -> int:
+    try:
+        from backend.tcp_proxy import get_active_connection_count
+
+        return get_active_connection_count()
+    except Exception:
+        return 0
+
+
 def get_dashboard_stats() -> dict[str, int]:
     return {
         "groups": count_groups(),
         "nodes": count_nodes(),
         "subscriptions": count_subscriptions(),
         "rules": count_rules(),
+        "active_connections": count_active_connections(),
     }

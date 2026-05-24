@@ -18,7 +18,7 @@ def get_default_settings() -> dict:
             "check_interval": 20,
             "max_fail_count": 2,
             "delay_timeout_ms": 5000,
-            "test_url": "https://cp.cloudflare.com/generate_204",
+            "test_url": "http://www.gstatic.com/generate_204",
         },
         "mihomo": {
             "exe": "",
@@ -31,6 +31,11 @@ def get_default_settings() -> dict:
             "auto_start_proxy": False,
             "enable_system_proxy_on_start": True,
             "disable_system_proxy_on_stop": True,
+        },
+        "logging": {
+            "console_enabled": False,
+            "debug_enabled": False,
+            "max_recent_activities": 200,
         },
     }
 

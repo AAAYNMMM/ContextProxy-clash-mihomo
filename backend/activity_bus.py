@@ -9,6 +9,7 @@ from typing import Callable
 from backend.paths import LOGS_DIR
 
 LOG_DIR = LOGS_DIR
+MAX_LOG_FILE_BYTES = 5 * 1024 * 1024
 
 _activity_callback: Callable[[str, str], None] | None = None
 _callback_lock = threading.RLock()
@@ -30,11 +31,25 @@ def set_activity_callback(callback: Callable[[str, str], None] | None):
 def _append_file(path: Path, message: str):
     try:
         LOG_DIR.mkdir(parents=True, exist_ok=True)
+        _rotate_log_if_needed(path)
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         with open(path, "a", encoding="utf-8", errors="replace") as file:
             file.write(f"{timestamp} {message}\n")
     except Exception:
         # Logging must never break proxy flow.
+        pass
+
+
+def _rotate_log_if_needed(path: Path):
+    try:
+        if not path.is_file() or path.stat().st_size < MAX_LOG_FILE_BYTES:
+            return
+
+        rotated = path.with_name(path.name + ".1")
+        if rotated.exists():
+            rotated.unlink()
+        path.replace(rotated)
+    except Exception:
         pass
 
 

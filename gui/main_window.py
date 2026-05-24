@@ -4,7 +4,7 @@ import re
 import socket
 
 from PySide6.QtCore import QObject, Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QAction, QColor, QFont, QIcon, QPainter, QPen, QPixmap
+from PySide6.QtGui import QAction, QColor, QFont, QIcon, QPainter, QPen, QPixmap, QTextCursor
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractItemView,
@@ -47,7 +47,7 @@ from gui.auto_selector_store import (
     get_selected_node_for_group,
     load_runtime_selected_nodes,
 )
-from gui.dashboard_store import get_dashboard_stats
+from gui.dashboard_store import count_active_connections, get_dashboard_stats
 from gui.notification import show_error_animation, show_success_animation, show_warning_animation
 from gui.process_manager import (
     cleanup_proxy_residue,
@@ -82,7 +82,7 @@ from gui.system_proxy_manager import (
 from gui.theme import APP_QSS, DANGER, MUTED, PRIMARY, SUCCESS, TEXT
 from gui.widgets.proxy_switch import ProxySwitch
 from backend.port_manager import prepare_mihomo_runtime_ports
-from backend.delay_tester import test_all_node_delays_via_main_controller
+from backend.delay_tester import cancel_delay_test, test_all_node_delays_via_main_controller
 from backend.activity_bus import set_activity_callback
 from backend.paths import PROJECT_ROOT
 
@@ -174,6 +174,10 @@ class MainWindow(QMainWindow):
         self._force_real_close = False
         self._last_backend_error_seen = None
         self._residue_cleanup_done = False
+        self._node_pool_last_loaded_count = None
+        self._max_recent_activities = int(
+            load_app_settings().get("logging", {}).get("max_recent_activities") or 200
+        )
 
         self._build_layout()
         self._setup_tray_icon()
@@ -292,7 +296,7 @@ class MainWindow(QMainWindow):
             ("\u8fd0\u884c\u72b6\u6001", get_proxy_status(), "\u7b49\u5f85\u542f\u52a8", SUCCESS if is_proxy_running() else MUTED),
             ("\u672c\u5730\u4ee3\u7406", proxy_endpoint, "HTTP / SOCKS5", TEXT),
             ("\u5f53\u524d\u6a21\u5f0f", "Context \u5206\u6d41", "\u667a\u80fd\u57df\u540d + \u7ec4\u95f4\u5206\u6d41", TEXT),
-            ("\u6d3b\u52a8\u8fde\u63a5", "0", "\u5f53\u524d\u6d3b\u8dc3\u6570", TEXT),
+            ("\u6d3b\u52a8\u8fde\u63a5", str(stats.get("active_connections", 0)), "\u5f53\u524d\u6d3b\u8dc3\u6570", TEXT),
             ("\u5206\u7ec4\u603b\u6570", str(stats["groups"]), "", TEXT),
             ("\u8282\u70b9\u603b\u6570", str(stats["nodes"]), "", TEXT),
             ("\u8ba2\u9605\u603b\u6570", str(stats["subscriptions"]), "", TEXT),
@@ -340,6 +344,17 @@ class MainWindow(QMainWindow):
                 self.activity_log.append(f"{timestamp}  {message}")
             else:
                 self.activity_log.append(f"{timestamp}  [{level}] {message}")
+            self._trim_activity_log()
+
+    def _trim_activity_log(self):
+        max_count = max(1, int(self._max_recent_activities or 200))
+
+        document = self.activity_log.document()
+        while document.blockCount() > max_count:
+            cursor = QTextCursor(document.firstBlock())
+            cursor.select(QTextCursor.SelectionType.BlockUnderCursor)
+            cursor.removeSelectedText()
+            cursor.deleteChar()
 
     def notify_success(self, message: str):
         self._append_activity_log(message, "INFO")
@@ -382,7 +397,12 @@ class MainWindow(QMainWindow):
         self._set_stat_value("\u8282\u70b9\u603b\u6570", str(stats["nodes"]))
         self._set_stat_value("\u8ba2\u9605\u603b\u6570", str(stats["subscriptions"]))
         self._set_stat_value("\u89c4\u5219\u603b\u6570", str(stats["rules"]))
+        self._refresh_active_connection_count()
         self._append_auto_selector_status_logs()
+
+    def _refresh_active_connection_count(self):
+        active_count = count_active_connections() if is_proxy_running() else 0
+        self._set_stat_value("\u6d3b\u52a8\u8fde\u63a5", str(active_count))
 
     def _poll_proxy_runtime_state(self):
         if self.proxy_action_thread:
@@ -391,14 +411,17 @@ class MainWindow(QMainWindow):
         state = get_proxy_state()
         if state == "starting":
             self._set_proxy_starting_status()
+            self._refresh_active_connection_count()
             return
 
         if state == "stopping":
             self._set_proxy_stopping_status()
+            self._refresh_active_connection_count()
             return
 
         running = is_proxy_running()
         self._set_proxy_status(running)
+        self._refresh_active_connection_count()
 
         if running:
             self._residue_cleanup_done = False
@@ -1018,7 +1041,9 @@ class MainWindow(QMainWindow):
 
         nodes = data.get("nodes", {})
         if not isinstance(nodes, dict) or not nodes:
-            self._append_activity_log("[WARN]  node_pool.yaml \u4e3a\u7a7a\uff0c\u8282\u70b9\u6c60\u8868\u683c\u672a\u586b\u5145")
+            if self._node_pool_last_loaded_count != 0:
+                self._append_activity_log("[WARN]  node_pool.yaml \u4e3a\u7a7a\uff0c\u8282\u70b9\u6c60\u8868\u683c\u672a\u586b\u5145")
+                self._node_pool_last_loaded_count = 0
             return []
 
         rows = []
@@ -1027,10 +1052,13 @@ class MainWindow(QMainWindow):
                 continue
             rows.append(self._node_to_table_row(index, fallback_name, node))
 
-        if rows:
+        if rows and self._node_pool_last_loaded_count != len(rows):
             self._append_activity_log(f"[INFO]  \u5df2\u52a0\u8f7d\u8282\u70b9\u6c60\uff1a{len(rows)} \u4e2a\u8282\u70b9")
-        else:
-            self._append_activity_log("[WARN]  node_pool.yaml \u672a\u5305\u542b\u53ef\u5c55\u793a\u7684\u8282\u70b9")
+            self._node_pool_last_loaded_count = len(rows)
+        elif not rows:
+            if self._node_pool_last_loaded_count != 0:
+                self._append_activity_log("[WARN]  node_pool.yaml \u672a\u5305\u542b\u53ef\u5c55\u793a\u7684\u8282\u70b9")
+                self._node_pool_last_loaded_count = 0
 
         return rows
 
@@ -2401,12 +2429,17 @@ class MainWindow(QMainWindow):
                 "enable_system_proxy_on_start": self.setting_checks["ui.enable_system_proxy_on_start"].isChecked(),
                 "disable_system_proxy_on_stop": self.setting_checks["ui.disable_system_proxy_on_stop"].isChecked(),
             },
+            "logging": previous_settings.get("logging", {}),
         }
 
         ok, error = save_app_settings(settings)
         if not ok:
             self.notify_error(f"保存失败：{error}")
             return
+
+        self._max_recent_activities = int(
+            load_app_settings().get("logging", {}).get("max_recent_activities") or 200
+        )
 
         message = "设置已保存"
         if self._settings_need_proxy_restart(previous_settings, settings):
@@ -2481,12 +2514,16 @@ class MainWindow(QMainWindow):
 
     def _start_node_delay_test(self):
         if self.delay_test_thread and self.delay_test_thread.isRunning():
-            self.notify_info("延迟测试正在进行中")
+            cancel_delay_test()
+            if self.node_delay_test_button:
+                self.node_delay_test_button.setEnabled(False)
+                self.node_delay_test_button.setText("正在取消...")
+            self.notify_info("节点池延迟测试正在取消")
             return
 
         if self.node_delay_test_button:
-            self.node_delay_test_button.setEnabled(False)
-            self.node_delay_test_button.setText("\u6d4b\u8bd5\u4e2d...")
+            self.node_delay_test_button.setEnabled(True)
+            self.node_delay_test_button.setText("取消测速")
 
         self._append_activity_log("[INFO] \u8282\u70b9\u6c60\u5ef6\u8fdf\u6d4b\u8bd5\u5df2\u5f00\u59cb")
 
@@ -2525,7 +2562,10 @@ class MainWindow(QMainWindow):
         if self.current_group_name:
             self._populate_group_node_table(set(self._current_group_nodes(self.current_group_name)))
 
-        self.notify_success(f"\u8282\u70b9\u6c60\u5ef6\u8fdf\u6d4b\u8bd5\u5b8c\u6210\uff1a{ok_count}/{total_count} \u53ef\u7528")
+        if result.get("cancelled"):
+            self.notify_info(f"节点池延迟测试已取消：已完成 {total_count} 个，{ok_count} 个可用")
+        else:
+            self.notify_success(f"\u8282\u70b9\u6c60\u5ef6\u8fdf\u6d4b\u8bd5\u5b8c\u6210\uff1a{ok_count}/{total_count} \u53ef\u7528")
 
     def _cleanup_node_delay_thread(self):
         self.delay_test_thread = None

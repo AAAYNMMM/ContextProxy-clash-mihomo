@@ -6,7 +6,6 @@ const portInput = document.getElementById("receiverPort");
 const statusEl = document.getElementById("status");
 const saveButton = document.getElementById("saveButton");
 const resetButton = document.getElementById("resetButton");
-const testButton = document.getElementById("testButton");
 
 function setStatus(message, type = "") {
   statusEl.textContent = message;
@@ -57,52 +56,7 @@ async function resetOptions() {
   setStatus("已恢复默认设置", "success");
 }
 
-async function testConnection() {
-  let config;
-  try {
-    config = readFormConfig();
-  } catch (err) {
-    setStatus(err.message || "端口设置无效", "error");
-    return;
-  }
-
-  const baseUrl = `http://${config.receiverHost}:${config.receiverPort}`;
-
-  try {
-    const healthResponse = await fetch(`${baseUrl}/health`, { method: "GET" });
-    if (healthResponse.ok) {
-      setStatus("连接成功", "success");
-      return;
-    }
-  } catch {
-    // Fall back to /report below.
-  }
-
-  try {
-    const reportResponse = await fetch(`${baseUrl}/report`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        tabHost: "extension-test.local",
-        requestHost: "extension-test.local"
-      })
-    });
-
-    if (reportResponse.ok) {
-      setStatus("连接成功", "success");
-      return;
-    }
-  } catch {
-    // Show a user-facing failure below.
-  }
-
-  setStatus("连接失败，请检查客户端是否启动以及端口是否一致", "error");
-}
-
 saveButton.addEventListener("click", saveOptions);
 resetButton.addEventListener("click", resetOptions);
-testButton.addEventListener("click", testConnection);
 
 loadOptions();

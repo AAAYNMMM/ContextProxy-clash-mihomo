@@ -1,5 +1,6 @@
 import asyncio
 import fnmatch
+import time
 from collections import defaultdict
 from pathlib import Path
 
@@ -7,6 +8,9 @@ from backend.runtime_config import get_valid_group_names, reload_group_config
 from backend.activity_bus import emit_activity, write_log
 
 APP_PROCESS_RULES = []
+APP_PROCESS_RULE_VERSION = 0
+APP_PROCESS_MATCH_CACHE = {}
+APP_PROCESS_CACHE_TTL = 8.0
 APP_PROCESS_FILE_PATH = None
 APP_PROCESS_FILE_LAST_MODIFY = 0
 APP_PROCESS_FILE_CHECK_INTERVAL = 5
@@ -98,13 +102,20 @@ def reload_app_process_file_now():
 
 
 def _reload_app_process_file():
-    global APP_PROCESS_RULES, APP_PROCESS_FILE_LAST_MODIFY
+    global APP_PROCESS_RULES, APP_PROCESS_RULE_VERSION, APP_PROCESS_FILE_LAST_MODIFY
 
     old_rules = APP_PROCESS_RULES
-    new_rules = _read_app_process_rules()
+    try:
+        new_rules = _read_app_process_rules()
+    except Exception as exc:
+        write_log("rules", f"App process rules reload failed, keeping old rules: {exc}", "WARN")
+        return set(), set()
+
     changed_groups = _get_changed_groups(old_rules, new_rules)
 
     APP_PROCESS_RULES = new_rules
+    APP_PROCESS_RULE_VERSION += 1
+    APP_PROCESS_MATCH_CACHE.clear()
     APP_PROCESS_FILE_LAST_MODIFY = APP_PROCESS_FILE_PATH.stat().st_mtime
 
     write_log("rules", f"App process rules loaded, count={len(APP_PROCESS_RULES)}")
@@ -154,9 +165,18 @@ def match_process_group(process_name: str):
         return None
 
     process_name = process_name.lower().strip()
+    cache_key = (APP_PROCESS_RULE_VERSION, process_name)
+    cached = APP_PROCESS_MATCH_CACHE.get(cache_key)
+    if cached:
+        group, created_at = cached
+        if time.monotonic() - created_at <= APP_PROCESS_CACHE_TTL:
+            return group
+        APP_PROCESS_MATCH_CACHE.pop(cache_key, None)
 
     for group, pattern in APP_PROCESS_RULES:
         if fnmatch.fnmatch(process_name, pattern):
+            APP_PROCESS_MATCH_CACHE[cache_key] = (group, time.monotonic())
             return group
 
+    APP_PROCESS_MATCH_CACHE[cache_key] = (None, time.monotonic())
     return None

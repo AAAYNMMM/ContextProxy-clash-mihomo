@@ -247,31 +247,41 @@ class BackendService:
 
     async def _async_start(self) -> tuple[bool, str | None]:
         self._set_state("starting")
+        total_start = time.perf_counter()
         try:
+            step_start = time.perf_counter()
             self.log("[BackendService] loading rules")
             init_request_queue()
             load_domain_file(str(GROUPS_DOMAINS_FILE))
             load_app_process_file(str(APP_PROCESSES_FILE))
+            self.log(f"[BackendService] rules ready in {time.perf_counter() - step_start:.2f}s")
 
+            step_start = time.perf_counter()
             self.log("[BackendService] starting mihomo")
             launch_mihomo_all()
-            self.log("[BackendService] mihomo started")
-            await asyncio.sleep(2)
+            self.log(f"[BackendService] mihomo started in {time.perf_counter() - step_start:.2f}s")
 
-            self.log("[BackendService] starting auto selector")
-            start_auto_selector()
-
+            step_start = time.perf_counter()
             self._create_task(start_batch_processor(), "batch_processor")
             self._create_task(start_app_process_watcher(), "app_process_watcher")
             self._create_task(start_process_cache_watcher(), "process_cache")
             self._create_task(start_tcp_proxy(), "tcp_proxy")
             self._create_task(start_receiver(), "receiver")
+            self.log(f"[BackendService] async tasks scheduled in {time.perf_counter() - step_start:.2f}s")
 
+            step_start = time.perf_counter()
             ok, error = await self._wait_until_healthy(timeout=10)
             if not ok:
                 raise RuntimeError(error or "backend health check failed")
+            self.log(f"[BackendService] health ready in {time.perf_counter() - step_start:.2f}s")
+
+            step_start = time.perf_counter()
+            self.log("[BackendService] starting auto selector")
+            start_auto_selector()
+            self.log(f"[BackendService] auto selector started in {time.perf_counter() - step_start:.2f}s")
 
             self._set_state("running")
+            self.log(f"[BackendService] startup completed in {time.perf_counter() - total_start:.2f}s")
             self.last_error = None
             self.started_event.set()
             return True, None

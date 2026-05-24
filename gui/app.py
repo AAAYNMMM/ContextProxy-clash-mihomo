@@ -74,6 +74,10 @@ sys.excepthook = _excepthook
 if hasattr(threading, "excepthook"):
     threading.excepthook = _threading_excepthook
 
+from backend.default_files import ensure_default_files
+
+ensure_default_files()
+
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication
 

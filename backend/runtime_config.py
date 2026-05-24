@@ -6,9 +6,9 @@ from backend.paths import CONFIG_DIR
 GROUP_NODES_FILE = CONFIG_DIR / "group_nodes.yaml"
 
 DEFAULT_GROUP_CONFIG = {
-    "AI": {"port": 7891, "controller": 9090},
-    "Media": {"port": 7892, "controller": 9091},
-    "Proxy": {"port": 7890, "controller": 9093},
+    "Proxy": {"port": 7890, "controller": 9090},
+    "AI": {"port": 7891, "controller": 9091},
+    "Media": {"port": 7892, "controller": 9092},
 }
 
 _GROUP_CONFIG_CACHE = None

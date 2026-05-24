@@ -1,6 +1,7 @@
 import asyncio
 import fnmatch
 import socket
+import threading
 import time
 from urllib.parse import urlparse
 
@@ -11,7 +12,7 @@ from backend.runtime_config import get_group_port_map
 from backend.batch_processor import REQUEST_GROUP_MAP
 from backend.app_process_rules import match_process_group
 from backend.group_runtime_state import is_group_restarting
-from backend.process_cache import get_process_name_from_cache
+from backend.process_cache import cache_process_lookup_miss, get_process_lookup_from_cache
 from backend.activity_bus import emit_activity, emit_routing_event, write_log
 
 
@@ -19,6 +20,7 @@ tcp_server = None
 
 # conn_id -> connection info
 ACTIVE_CONNECTIONS = {}
+ACTIVE_CONNECTIONS_LOCK = threading.RLock()
 
 NORMAL_BUFFER_SIZE = 64 * 1024
 NORMAL_DRAIN_THRESHOLD = 256 * 1024
@@ -296,8 +298,8 @@ def get_process_name_by_client_writer(client_writer: asyncio.StreamWriter):
     client_ip = peer[0]
     client_port = peer[1]
 
-    cached_process_name = get_process_name_from_cache(client_ip, client_port)
-    if cached_process_name:
+    cache_hit, cached_process_name = get_process_lookup_from_cache(client_ip, client_port)
+    if cache_hit:
         return cached_process_name
 
     try:
@@ -315,11 +317,13 @@ def get_process_name_by_client_writer(client_writer: asyncio.StreamWriter):
                 try:
                     return psutil.Process(conn.pid).name()
                 except Exception:
+                    cache_process_lookup_miss(client_ip, client_port)
                     return None
 
     except Exception as e:
         write_log("tcp", f"process lookup failed: {e}", "WARN")
 
+    cache_process_lookup_miss(client_ip, client_port)
     return None
 
 
@@ -332,22 +336,24 @@ def register_active_connection(
 ):
     conn_id = id(client_writer)
 
-    ACTIVE_CONNECTIONS[conn_id] = {
-        "writer": client_writer,
-        "remote_writer": None,
-        "request_host": request_host,
-        "request_port": request_port,
-        "final_group": final_group,
-        "process_name": (process_name or "").lower().strip(),
-        "created_at": time.monotonic(),
-    }
+    with ACTIVE_CONNECTIONS_LOCK:
+        ACTIVE_CONNECTIONS[conn_id] = {
+            "writer": client_writer,
+            "remote_writer": None,
+            "request_host": request_host,
+            "request_port": request_port,
+            "final_group": final_group,
+            "process_name": (process_name or "").lower().strip(),
+            "created_at": time.monotonic(),
+        }
 
     return conn_id
 
 
 def unregister_active_connection(conn_id):
     if conn_id is not None:
-        ACTIVE_CONNECTIONS.pop(conn_id, None)
+        with ACTIVE_CONNECTIONS_LOCK:
+            ACTIVE_CONNECTIONS.pop(conn_id, None)
 
 
 def set_remote_writer(conn_id, remote_writer):
@@ -356,8 +362,46 @@ def set_remote_writer(conn_id, remote_writer):
     if conn_id is None:
         return
 
-    if conn_id in ACTIVE_CONNECTIONS:
-        ACTIVE_CONNECTIONS[conn_id]["remote_writer"] = remote_writer
+    with ACTIVE_CONNECTIONS_LOCK:
+        if conn_id in ACTIVE_CONNECTIONS:
+            ACTIVE_CONNECTIONS[conn_id]["remote_writer"] = remote_writer
+
+
+def get_active_connection_count() -> int:
+    try:
+        with ACTIVE_CONNECTIONS_LOCK:
+            return len(ACTIVE_CONNECTIONS)
+    except Exception:
+        return 0
+
+
+def get_active_connection_snapshot() -> list[dict]:
+    try:
+        now = time.monotonic()
+        with ACTIVE_CONNECTIONS_LOCK:
+            items = list(ACTIVE_CONNECTIONS.items())
+    except Exception:
+        return []
+
+    snapshot = []
+    for _conn_id, info in items:
+        created_at = info.get("created_at")
+        try:
+            duration = int(now - float(created_at))
+        except Exception:
+            duration = 0
+
+        snapshot.append(
+            {
+                "host": str(info.get("request_host") or ""),
+                "port": info.get("request_port"),
+                "group": str(info.get("final_group") or ""),
+                "process": str(info.get("process_name") or ""),
+                "duration": max(0, duration),
+            }
+        )
+
+    return snapshot
 
 
 def close_connection_info(conn_id, info):
@@ -369,13 +413,17 @@ def close_connection_info(conn_id, info):
     force_close_writer(client_writer)
     force_close_writer(remote_writer)
 
-    ACTIVE_CONNECTIONS.pop(conn_id, None)
+    with ACTIVE_CONNECTIONS_LOCK:
+        ACTIVE_CONNECTIONS.pop(conn_id, None)
 
 
 def close_connections_by_group(group_name: str):
     closed = 0
 
-    for conn_id, info in list(ACTIVE_CONNECTIONS.items()):
+    with ACTIVE_CONNECTIONS_LOCK:
+        items = list(ACTIVE_CONNECTIONS.items())
+
+    for conn_id, info in items:
         if info.get("final_group") != group_name:
             continue
 
@@ -389,7 +437,10 @@ def close_connections_by_groups(group_names: set[str] | list[str]):
     total = 0
     group_set = set(group_names)
 
-    for conn_id, info in list(ACTIVE_CONNECTIONS.items()):
+    with ACTIVE_CONNECTIONS_LOCK:
+        items = list(ACTIVE_CONNECTIONS.items())
+
+    for conn_id, info in items:
         if info.get("final_group") not in group_set:
             continue
 
@@ -426,7 +477,10 @@ def close_connections_by_domain_patterns(patterns: set[str] | list[str]):
         return 0
 
     closed = 0
-    for conn_id, info in list(ACTIVE_CONNECTIONS.items()):
+    with ACTIVE_CONNECTIONS_LOCK:
+        items = list(ACTIVE_CONNECTIONS.items())
+
+    for conn_id, info in items:
         request_host = str(info.get("request_host") or "").lower().strip()
         if not request_host:
             continue
@@ -448,7 +502,10 @@ def close_connections_by_process_patterns(patterns: set[str] | list[str]):
         return 0
 
     closed = 0
-    for conn_id, info in list(ACTIVE_CONNECTIONS.items()):
+    with ACTIVE_CONNECTIONS_LOCK:
+        items = list(ACTIVE_CONNECTIONS.items())
+
+    for conn_id, info in items:
         process_name = str(info.get("process_name") or "").lower().strip()
         if not process_name:
             continue
@@ -468,7 +525,10 @@ def close_connections_by_host(request_host: str):
     request_host = request_host.lower().strip()
     closed = 0
 
-    for conn_id, info in list(ACTIVE_CONNECTIONS.items()):
+    with ACTIVE_CONNECTIONS_LOCK:
+        items = list(ACTIVE_CONNECTIONS.items())
+
+    for conn_id, info in items:
         if info.get("request_host") != request_host:
             continue
 
@@ -482,7 +542,10 @@ def close_connections_by_host(request_host: str):
 def close_all_active_connections():
     closed = 0
 
-    for conn_id, info in list(ACTIVE_CONNECTIONS.items()):
+    with ACTIVE_CONNECTIONS_LOCK:
+        items = list(ACTIVE_CONNECTIONS.items())
+
+    for conn_id, info in items:
         close_connection_info(conn_id, info)
         closed += 1
 
