@@ -1860,10 +1860,12 @@ func (c *Core) decideGroup(requestHost string, lookup ProcessLookupResult) Route
 			c.tabWaitHitCount.Add(1)
 			return decision
 		}
-		base.TabHost = report.TabHost
-		base.ReportProcessName = report.ProcessName
-		base.ReportProcessIdentity = report.ProcessIdentity
-		base.TabWaitResult = "report_no_rule"
+
+		// A Tab report is authoritative for browser context. If the page
+		// itself has no matching rule, do not fall back to the browser
+		// process rule; otherwise ordinary sites such as Baidu/Bilibili can be
+		// incorrectly routed by a broad browser App rule.
+		return c.directFromTabNoRule(base, report, "report_no_rule", 0)
 	}
 
 	if c.tabWaitEnabled() {
@@ -1892,7 +1894,11 @@ func (c *Core) decideGroup(requestHost string, lookup ProcessLookupResult) Route
 					c.tabWaitHitCount.Add(1)
 					return decision
 				}
-				waitResult = "report_no_rule"
+
+				// The waited Tab report arrived but the page host has no rule. Treat
+				// that as an explicit Direct decision instead of falling through to a
+				// browser process rule.
+				return c.directFromTabNoRule(base, report, "report_no_rule", elapsedMS)
 			}
 			base.TabWaitMS = elapsedMS
 			base.TabHost = tabHost
@@ -1953,6 +1959,18 @@ func (c *Core) decisionFromTabReport(requestHost string, report Report, base Rou
 	}
 	_ = requestHost
 	return base, false
+}
+
+func (c *Core) directFromTabNoRule(base RouteDecision, report Report, waitResult string, elapsedMS int) RouteDecision {
+	base.Group = directGroup
+	base.Source = "direct"
+	base.SourceReason = "tab_report_no_rule"
+	base.TabHost = report.TabHost
+	base.TabWaitMS = elapsedMS
+	base.TabWaitResult = waitResult
+	base.ReportProcessName = report.ProcessName
+	base.ReportProcessIdentity = report.ProcessIdentity
+	return base
 }
 
 func (c *Core) decideAfterTabWait(requestHost string, processIdentity ProcessIdentity, base RouteDecision) RouteDecision {

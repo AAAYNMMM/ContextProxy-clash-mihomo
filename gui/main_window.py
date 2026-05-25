@@ -2594,13 +2594,14 @@ class MainWindow(QMainWindow):
     def _save_domain_rules(self):
         if self.busy:
             return
+        old_rules = load_domain_rules()
         rules = self._rules_from_table(self.domain_rule_table)
         if not self._confirm_missing_groups(rules):
             return
 
         def task():
             save_domain_rules(rules)
-            changed_groups, changed_patterns = self._reload_domain_rules_immediately()
+            changed_groups, changed_patterns = self._reload_domain_rules_immediately(old_rules, rules)
             return changed_groups, changed_patterns
 
         def on_success(result):
@@ -2623,13 +2624,14 @@ class MainWindow(QMainWindow):
     def _save_process_rules(self):
         if self.busy:
             return
+        old_rules = load_process_rules()
         rules = self._rules_from_table(self.process_rule_table)
         if not self._confirm_missing_groups(rules):
             return
 
         def task():
             save_process_rules(rules)
-            changed_groups, changed_patterns = self._reload_process_rules_immediately()
+            changed_groups, changed_patterns = self._reload_process_rules_immediately(old_rules, rules)
             return changed_groups, changed_patterns
 
         def on_success(result):
@@ -2649,32 +2651,51 @@ class MainWindow(QMainWindow):
             task_name="保存进程规则",
         )
 
-    def _reload_domain_rules_immediately(self) -> tuple[set[str], set[str]]:
+    def _reload_domain_rules_immediately(
+        self,
+        old_rules: list[tuple[str, str]] | None = None,
+        new_rules: list[tuple[str, str]] | None = None,
+    ) -> tuple[set[str], set[str]]:
         try:
             from backend.core_launcher import reload_core_config
             from backend.connection_closer import close_changed_groups
 
             reload_core_config()
-            rules = load_domain_rules()
-            changed_groups = {group for group, _pattern in rules}
+            current_rules = new_rules if new_rules is not None else load_domain_rules()
+            old_rules = old_rules or []
+
+            # Close both old and new groups. When a rule moves from Proxy -> AI
+            # -> Media, the old persistent HTTP/2/WebSocket connections are
+            # still attached to the old group and must be closed too; closing
+            # only the new group leaves stale browser links alive after several
+            # consecutive rule edits.
+            affected_rules = list(old_rules) + list(current_rules)
+            changed_groups = {group for group, _pattern in affected_rules}
             if changed_groups:
                 close_changed_groups(changed_groups)
-            return changed_groups, {pattern for _group, pattern in rules}
+            return changed_groups, {pattern for _group, pattern in affected_rules}
         except Exception as exc:
             _ = exc
             return set(), set()
 
-    def _reload_process_rules_immediately(self) -> tuple[set[str], set[str]]:
+    def _reload_process_rules_immediately(
+        self,
+        old_rules: list[tuple[str, str]] | None = None,
+        new_rules: list[tuple[str, str]] | None = None,
+    ) -> tuple[set[str], set[str]]:
         try:
             from backend.core_launcher import reload_core_config
             from backend.connection_closer import close_changed_groups
 
             reload_core_config()
-            rules = load_process_rules()
-            changed_groups = {group for group, _process in rules}
+            current_rules = new_rules if new_rules is not None else load_process_rules()
+            old_rules = old_rules or []
+
+            affected_rules = list(old_rules) + list(current_rules)
+            changed_groups = {group for group, _process in affected_rules}
             if changed_groups:
                 close_changed_groups(changed_groups)
-            return changed_groups, {process for _group, process in rules}
+            return changed_groups, {process for _group, process in affected_rules}
         except Exception as exc:
             _ = exc
             return set(), set()
