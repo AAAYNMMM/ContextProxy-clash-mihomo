@@ -81,21 +81,21 @@ def _friendly_subscription_error(exc: Exception) -> str:
     lower = text.lower()
 
     if "403" in text:
-        return "subscription returned 403; the link may be expired or unauthorized"
+        return "订阅返回 403：链接可能已过期或无权限访问"
 
     if "404" in text:
-        return "璁㈤槄杩斿洖 404锛氶摼鎺ヤ笉瀛樺湪鎴栬闃呭湴鍧€濉啓閿欒"
+        return "订阅返回 404：链接不存在或订阅地址填写错误"
 
     if "timed out" in lower or "timeout" in lower or "read timed out" in lower:
-        return "璁㈤槄璇锋眰瓒呮椂锛氳妫€鏌ョ綉缁滄垨绋嶅悗閲嶈瘯"
+        return "订阅请求超时：请检查网络或稍后重试"
 
     if "connection" in lower or "failed to establish" in lower or "connection aborted" in lower:
-        return "subscription connection failed; check network, proxy, or subscription server"
+        return "订阅连接失败：请检查网络、代理或订阅服务器"
 
-    if "鏈彁鍙栧埌鑺傜偣" in text or "鑺傜偣" in text and "0" in text:
-        return "璁㈤槄瑙ｆ瀽鎴愬姛浣嗘病鏈夋彁鍙栧埌鑺傜偣锛氬彲鑳戒笉鏄?Clash/Mihomo YAML 璁㈤槄锛屾垨璁㈤槄鍐呭涓虹┖"
+    if "未提取到节点" in text or "节点" in text and "0" in text or "no nodes" in lower:
+        return "订阅解析成功但没有提取到节点：可能不是 Clash/Mihomo YAML 订阅，或订阅内容为空"
 
-    return text or "鏈煡閿欒"
+    return text or "未知错误"
 
 def load_subscription_meta() -> dict:
     if not SUBSCRIPTIONS_META_FILE.is_file():

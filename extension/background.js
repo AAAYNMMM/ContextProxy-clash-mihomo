@@ -9,6 +9,7 @@ let receiverOnline = false;
 let lastHealthCheckAt = 0;
 let offlineQueue = [];
 let recentReportAt = new Map();
+let tabHostCache = new Map();
 
 console.log("ContextProxy extension loaded");
 
@@ -52,12 +53,34 @@ function shouldReportNow(payload) {
 async function getTabHost(tabId) {
   if (tabId < 0) return "";
 
+  const cached = tabHostCache.get(tabId);
+  if (cached) return cached;
+
   try {
     const tab = await chrome.tabs.get(tabId);
-    return getHostname(tab.url || "");
+    const host = getHostname(tab.url || "");
+    if (host) tabHostCache.set(tabId, host);
+    return host;
   } catch {
     return "";
   }
+}
+
+function rememberTabHost(tabId, url) {
+  if (tabId < 0) return "";
+  const host = getHostname(url || "");
+  if (host) {
+    tabHostCache.set(tabId, host);
+  }
+  return host;
+}
+
+function getRequestContextHost(details) {
+  return (
+    getHostname(details.initiator || "") ||
+    getHostname(details.documentUrl || "") ||
+    getHostname(details.originUrl || "")
+  );
 }
 
 async function getReceiverConfig() {
@@ -83,12 +106,12 @@ async function getReportUrl() {
 }
 
 async function postReport(payload) {
-  const reportUrl = await getReportUrl();
+  const config = await getReceiverConfig();
+  const reportUrl = `http://${config.host}:${config.port}/report`;
+  const headers = { "Content-Type": "application/json" };
   const response = await fetch(reportUrl, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json"
-    },
+    headers,
     body: JSON.stringify({
       tabHost: payload.tabHost,
       requestHost: payload.requestHost
@@ -97,6 +120,20 @@ async function postReport(payload) {
 
   if (!response.ok) {
     throw new Error(`report failed: ${response.status}`);
+  }
+}
+
+async function registerBrowser() {
+  try {
+    const config = await getReceiverConfig();
+    const headers = { "Content-Type": "application/json" };
+    await fetch(`http://${config.host}:${config.port}/register_browser`, {
+      method: "POST",
+      headers,
+      body: "{}"
+    });
+  } catch (err) {
+    console.warn("[ContextProxy] register browser failed:", err);
   }
 }
 
@@ -116,7 +153,16 @@ async function reportPayload(payload, options = {}) {
 }
 
 async function reportRequest(details) {
-  const tabHost = await getTabHost(details.tabId);
+  let tabHost = getRequestContextHost(details);
+  if (tabHost && details.tabId >= 0) {
+    tabHostCache.set(details.tabId, tabHost);
+  }
+  if (!tabHost && details.tabId >= 0) {
+    tabHost = tabHostCache.get(details.tabId) || "";
+  }
+  if (!tabHost) {
+    tabHost = await getTabHost(details.tabId);
+  }
   const requestHost = getHostname(details.url);
 
   if (!tabHost || !requestHost) return;
@@ -140,6 +186,7 @@ async function checkReceiverOnline() {
     receiverOnline = response.ok;
 
     if (!wasOnline && receiverOnline) {
+      await registerBrowser();
       await flushOfflineReports();
       await reportAllOpenTabs();
     }
@@ -196,22 +243,28 @@ chrome.tabs.onActivated.addListener(async (activeInfo) => {
   }
 });
 
-chrome.tabs.onUpdated.addListener(async (_tabId, changeInfo, tab) => {
+chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
   if (changeInfo.status !== "complete" && !changeInfo.url) return;
 
-  const tabHost = getHostname(tab.url || changeInfo.url || "");
+  const tabHost = rememberTabHost(tabId, tab.url || changeInfo.url || "");
   if (tabHost) {
     await reportPayload({ tabHost, requestHost: tabHost }, { force: true });
   }
 });
 
+chrome.tabs.onRemoved.addListener((tabId) => {
+  tabHostCache.delete(tabId);
+});
+
 chrome.runtime.onInstalled.addListener(() => {
   chrome.alarms.create("contextproxy-health", { periodInMinutes: 0.5 });
+  registerBrowser();
   checkReceiverOnline();
 });
 
 chrome.runtime.onStartup.addListener(() => {
   chrome.alarms.create("contextproxy-health", { periodInMinutes: 0.5 });
+  registerBrowser();
   checkReceiverOnline();
 });
 
@@ -222,4 +275,5 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 });
 
 setInterval(checkReceiverOnline, HEALTH_CHECK_INTERVAL_MS);
+registerBrowser();
 checkReceiverOnline();

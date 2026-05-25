@@ -1,5 +1,6 @@
-﻿from pathlib import Path
 from datetime import datetime
+from pathlib import Path
+
 import yaml
 
 from backend.paths import CONFIG_DIR
@@ -18,36 +19,31 @@ def load_yaml(path: Path, default):
         return default
 
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = yaml.safe_load(f)
+        with open(path, "r", encoding="utf-8") as file:
+            data = yaml.safe_load(file)
             return data if data is not None else default
-    except Exception as e:
-        print(f"[鍚屾] 璇诲彇澶辫触: {path} | {e}")
+    except Exception as exc:
+        print(f"[sync] failed to read {path}: {exc}")
         return default
 
 
 def save_yaml(path: Path, data):
     path.parent.mkdir(parents=True, exist_ok=True)
-
-    with open(path, "w", encoding="utf-8") as f:
-        yaml.safe_dump(
-            data,
-            f,
-            allow_unicode=True,
-            sort_keys=False,
-        )
+    with open(path, "w", encoding="utf-8") as file:
+        yaml.safe_dump(data, file, allow_unicode=True, sort_keys=False)
 
 
 def sync_group_nodes_with_node_pool():
     """
-    鏍规嵁 node_pool.yaml 鑷姩娓呯悊 group_nodes.yaml銆?
-    濡傛灉鏌愪釜鍒嗙粍寮曠敤浜嗗凡缁忎笉瀛樺湪鐨勮妭鐐癸紝鐩存帴鍒犻櫎杩欎釜寮曠敤銆?
-    杩斿洖锛氬彂鐢熻妭鐐瑰紩鐢ㄥ彉鍖栫殑鍒嗙粍闆嗗悎銆?    """
+    Remove group node references that no longer exist in node_pool.yaml.
+
+    Returns a set of group names whose node list changed.
+    """
     node_pool_data = load_yaml(NODE_POOL_FILE, {})
     group_nodes_data = load_yaml(GROUP_NODES_FILE, {})
 
-    node_pool = node_pool_data.get("nodes", {})
-    groups = group_nodes_data.get("groups", {})
+    node_pool = node_pool_data.get("nodes", {}) if isinstance(node_pool_data, dict) else {}
+    groups = group_nodes_data.get("groups", {}) if isinstance(group_nodes_data, dict) else {}
 
     if not isinstance(node_pool, dict):
         print("[sync] node_pool.yaml format invalid, skip sync")
@@ -58,12 +54,11 @@ def sync_group_nodes_with_node_pool():
         return set()
 
     valid_node_names = set(node_pool.keys())
-
     total_removed = 0
     changed_groups = set()
 
     for group_name, group_data in groups.items():
-        nodes = group_data.get("nodes", [])
+        nodes = group_data.get("nodes", []) if isinstance(group_data, dict) else []
 
         if not isinstance(nodes, list):
             group_data["nodes"] = []
@@ -71,11 +66,7 @@ def sync_group_nodes_with_node_pool():
             continue
 
         before = len(nodes)
-
-        group_data["nodes"] = [
-            node_name for node_name in nodes
-            if node_name in valid_node_names
-        ]
+        group_data["nodes"] = [node_name for node_name in nodes if node_name in valid_node_names]
 
         removed = before - len(group_data["nodes"])
         total_removed += removed
@@ -85,11 +76,9 @@ def sync_group_nodes_with_node_pool():
             print(f"[sync] {group_name} removed {removed} invalid nodes")
 
     group_nodes_data["updated_at"] = now_str()
-
     save_yaml(GROUP_NODES_FILE, group_nodes_data)
 
     print(f"[sync] group_nodes.yaml synced, removed invalid nodes total={total_removed}")
-
     return changed_groups
 
 

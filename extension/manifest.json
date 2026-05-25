@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "ContextProxy Reporter",
   "version": "0.1.0",
-  "description": "Report tabHost and requestUrl to local Python service.",
+  "description": "Report tabHost and requestHost to the local ContextProxy core service.",
   "permissions": [
     "webRequest",
     "tabs",

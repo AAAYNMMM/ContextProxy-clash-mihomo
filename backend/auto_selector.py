@@ -1,6 +1,3 @@
-import asyncio
-import time
-from collections import deque
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote
@@ -8,9 +5,8 @@ from urllib.parse import quote
 import yaml
 
 from backend.activity_bus import emit_activity, write_log
-from backend.app_settings import get_auto_select_settings, get_mihomo_controller_port
+from backend.app_settings import get_mihomo_controller_port
 from backend.delay_tester import (
-    health_check_urls,
     is_main_controller_available,
     test_node_delay_via_main_controller,
 )
@@ -21,28 +17,16 @@ from backend.paths import CONFIG_DIR
 GROUP_NODES_FILE = CONFIG_DIR / "group_nodes.yaml"
 RUNTIME_SELECTED_NODES_FILE = CONFIG_DIR / "runtime_selected_nodes.yaml"
 
-MONITOR_INTERVAL_SECONDS = 20
-HEALTH_WINDOW_SIZE = 5
-HEALTH_WINDOW_FAIL_THRESHOLD = 3
+BAD_NODE_TTL_SECONDS = 10 * 60
 
 _selected_nodes: dict[str, str] = {}
 _selected_delays: dict[str, int | None] = {}
-_fail_counts: dict[str, int] = {}
-_health_windows: dict[str, deque[bool]] = {}
-_monitor_task = None
+_bad_nodes: dict[str, dict[str, float]] = {}
 _running = False
 
 
 def _log(message: str, level: str = "INFO"):
     write_log("auto_select", message, level)
-
-
-def _auto_select_settings() -> dict:
-    return get_auto_select_settings()
-
-
-def _monitor_interval_seconds() -> int:
-    return int(_auto_select_settings().get("check_interval") or MONITOR_INTERVAL_SECONDS)
 
 
 def _load_yaml(path: Path, default):
@@ -136,7 +120,7 @@ def get_current_node_for_group(group_name: str) -> str | None:
 
 
 def start_auto_selector():
-    global _monitor_task, _running
+    global _running
 
     if _running:
         _log("already running")
@@ -145,34 +129,14 @@ def start_auto_selector():
     _running = True
     _load_runtime_selected_nodes()
     initialize_selected_nodes_without_delay()
-
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        _log("no running event loop; startup selection only", "WARN")
-        return
-
-    _monitor_task = loop.create_task(monitor_current_nodes())
-    _log("monitor started")
+    _log("started without periodic delay health checks")
 
 
 def stop_auto_selector():
-    global _monitor_task, _running
+    global _running
 
     _running = False
-
-    if _monitor_task and not _monitor_task.done():
-        _monitor_task.cancel()
-
-    _monitor_task = None
     _log("stopped")
-
-
-def select_best_node_for_all_groups():
-    groups = _load_group_nodes()
-    for group_name, group_data in groups.items():
-        if isinstance(group_data, dict):
-            select_best_node_for_group(str(group_name))
 
 
 def initialize_selected_nodes_without_delay():
@@ -193,8 +157,6 @@ def initialize_selected_nodes_without_delay():
             if current_node:
                 _selected_nodes.pop(group_name, None)
                 _selected_delays.pop(group_name, None)
-                _fail_counts.pop(group_name, None)
-                _health_windows.pop(group_name, None)
                 changed = True
             _log(f"{group_name} has no nodes at startup")
             continue
@@ -206,8 +168,6 @@ def initialize_selected_nodes_without_delay():
             selected_node = nodes[0]
             _selected_nodes[group_name] = selected_node
             _selected_delays[group_name] = None
-            _fail_counts[group_name] = 0
-            _health_windows[group_name] = deque(maxlen=HEALTH_WINDOW_SIZE)
             changed = True
             _log(f"{group_name} use first node: {selected_node}")
 
@@ -216,6 +176,108 @@ def initialize_selected_nodes_without_delay():
 
     if changed:
         _save_runtime_selected_nodes()
+
+
+def _prune_bad_nodes(group_name: str | None = None):
+    now = time_monotonic()
+    groups = [group_name] if group_name else list(_bad_nodes.keys())
+    for name in groups:
+        entries = _bad_nodes.get(str(name), {})
+        expired = [node for node, expires_at in entries.items() if expires_at <= now]
+        for node in expired:
+            entries.pop(node, None)
+        if not entries:
+            _bad_nodes.pop(str(name), None)
+
+
+def time_monotonic() -> float:
+    import time
+
+    return time.monotonic()
+
+
+def mark_current_node_bad(group_name: str, reason: str = "real_traffic_failure", ttl: int = BAD_NODE_TTL_SECONDS) -> str | None:
+    node_name = _selected_nodes.get(str(group_name))
+    if not node_name:
+        return None
+    mark_node_bad(group_name, node_name, reason=reason, ttl=ttl)
+    return node_name
+
+
+def mark_node_bad(group_name: str, node_name: str, reason: str = "real_traffic_failure", ttl: int = BAD_NODE_TTL_SECONDS):
+    group_name = str(group_name)
+    node_name = str(node_name)
+    expires_at = time_monotonic() + max(1, int(ttl))
+    _bad_nodes.setdefault(group_name, {})[node_name] = expires_at
+    _log(f"{group_name} mark bad node: {node_name}, ttl={ttl}s, reason={reason}", "WARN")
+
+
+def _bad_node_names(group_name: str) -> set[str]:
+    _prune_bad_nodes(group_name)
+    return set(_bad_nodes.get(str(group_name), {}).keys())
+
+
+def select_next_node_for_group(group_name: str, reason: str = "real_traffic_failure") -> str | None:
+    """Select a replacement node without running delay checks.
+
+    This is used by real-traffic recovery. It intentionally relies on the
+    configured group order and temporary bad-node exclusions instead of
+    periodic delay probing.
+    """
+    group_name = str(group_name)
+    controller_port = get_mihomo_controller_port()
+    if not is_main_controller_available(controller_port):
+        _log(f"main controller unavailable, skip group: {group_name}", "WARN")
+        return None
+
+    nodes = _group_nodes(group_name)
+    if not nodes:
+        _log(f"{group_name} has no nodes, skip")
+        return None
+
+    current = _selected_nodes.get(group_name)
+    excluded_bad = _bad_node_names(group_name)
+    candidates = [node for node in nodes if node not in excluded_bad]
+    if current in candidates and len(candidates) > 1:
+        candidates = [node for node in candidates if node != current]
+
+    if not candidates:
+        if current in nodes:
+            _log(
+                f"{group_name} no replacement candidate, keep current: {current}, "
+                f"excluded_bad_nodes={sorted(excluded_bad)}",
+                "WARN",
+            )
+            emit_activity(
+                f"{group_name} 暂无其他可用候选节点，保持当前节点",
+                "WARN",
+                key=f"auto-select:keep-current:{group_name}",
+                ttl=180,
+            )
+            return current
+        candidates = nodes
+
+    selected_node = candidates[0]
+    previous_node = current
+    if switch_group_node(controller_port, group_name, selected_node):
+        _selected_nodes[group_name] = selected_node
+        _selected_delays[group_name] = None
+        _save_runtime_selected_nodes()
+        _log(
+            f"{group_name} selected replacement: old={previous_node}, new={selected_node}, "
+            f"excluded_bad_nodes={sorted(excluded_bad)}, selection_basis=group_order, reason={reason}",
+            "WARN",
+        )
+        if selected_node != previous_node:
+            emit_activity(
+                f"{group_name} 已根据真实流量故障切换节点：{selected_node}",
+                "INFO",
+                key=f"auto-select:traffic-switch:{group_name}:{selected_node}",
+                ttl=120,
+            )
+        return selected_node
+
+    return None
 
 
 def select_best_node_for_group(group_name):
@@ -261,8 +323,6 @@ def select_best_node_for_group(group_name):
     if switch_group_node(controller_port, group_name, best_node):
         _selected_nodes[group_name] = best_node
         _selected_delays[group_name] = best_delay
-        _fail_counts[group_name] = 0
-        _health_windows[group_name] = deque([True], maxlen=HEALTH_WINDOW_SIZE)
         _save_runtime_selected_nodes()
         _log(f"{group_name} selected node: {best_node}, delay {best_delay}ms")
         if best_node != previous_node:
@@ -275,91 +335,6 @@ def select_best_node_for_group(group_name):
         return best_node
 
     return None
-
-
-async def monitor_current_nodes():
-    while _running:
-        await asyncio.sleep(_monitor_interval_seconds())
-
-        groups = _load_group_nodes()
-        controller_port = get_mihomo_controller_port()
-        if not is_main_controller_available(controller_port):
-            _log("main controller unavailable, skip health check", "WARN")
-            continue
-
-        for group_name in groups.keys():
-            group_name = str(group_name)
-            current_node = _selected_nodes.get(group_name)
-            nodes = _group_nodes(group_name)
-            valid_nodes = set(nodes)
-
-            if not current_node or current_node not in valid_nodes:
-                _log(f"{group_name} has no current selection, using first node")
-                if nodes:
-                    selected_node = nodes[0]
-                    _selected_nodes[group_name] = selected_node
-                    _selected_delays[group_name] = None
-                    _fail_counts[group_name] = 0
-                    _health_windows[group_name] = deque(maxlen=HEALTH_WINDOW_SIZE)
-                    switch_group_node(controller_port, group_name, selected_node)
-                    _save_runtime_selected_nodes()
-                continue
-
-            if is_current_node_healthy(controller_port, current_node):
-                _record_health_sample(group_name, True)
-                _log(f"{group_name} current node ok: {current_node}", "DEBUG")
-                continue
-
-            failed = _record_health_sample(group_name, False)
-            window = list(_health_windows.get(group_name, []))
-            if not failed:
-                _log(
-                    f"{group_name} current node failed sample "
-                    f"{window.count(False)}/{len(window)}: {current_node}",
-                    "WARN",
-                )
-                continue
-
-            _log(f"{group_name} current node health window failed, reselecting", "WARN")
-            previous_node = _selected_nodes.get(group_name)
-            selected_node = select_best_node_for_group(group_name)
-
-            if selected_node and selected_node != previous_node:
-                try:
-                    from backend.connection_closer import close_changed_groups
-
-                    close_changed_groups({group_name})
-                except Exception as exc:
-                    _log(f"{group_name} close old connections failed: {exc}", "WARN")
-
-
-def _record_health_sample(group_name: str, success: bool) -> bool:
-    window = _health_windows.setdefault(group_name, deque(maxlen=HEALTH_WINDOW_SIZE))
-    window.append(bool(success))
-    if success:
-        _fail_counts[group_name] = 0
-    else:
-        _fail_counts[group_name] = _fail_counts.get(group_name, 0) + 1
-
-    return (
-        len(window) >= HEALTH_WINDOW_SIZE
-        and window.count(False) >= HEALTH_WINDOW_FAIL_THRESHOLD
-    )
-
-
-def is_current_node_healthy(controller_port, node_name: str) -> bool:
-    if test_node_delay(controller_port, node_name) is not None:
-        return True
-
-    time.sleep(1)
-    if test_node_delay(controller_port, node_name) is not None:
-        return True
-
-    for url in health_check_urls():
-        if test_node_delay(controller_port, node_name, test_url=url, allow_retry=False) is not None:
-            return True
-
-    return False
 
 
 def _delay_from_result(result: dict | None):

@@ -14,10 +14,8 @@ def get_default_settings() -> dict:
             "listen_port": 18000,
             "receiver_port": 17890,
         },
-        "auto_select": {
-            "check_interval": 20,
-            "max_fail_count": 2,
-            "delay_timeout_ms": 5000,
+        "latency_test": {
+            "timeout_ms": 5000,
             "test_url": "https://www.gstatic.com/generate_204",
         },
         "mihomo": {
@@ -78,8 +76,13 @@ def _merge_defaults(settings: dict) -> dict:
     merged = deepcopy(get_default_settings())
     settings = dict(settings)
 
-    if "auto_select" not in settings and "auto_selector" in settings:
-        settings["auto_select"] = settings.get("auto_selector")
+    if "latency_test" not in settings:
+        legacy_auto_select = settings.get("auto_select", settings.get("auto_selector", {}))
+        if isinstance(legacy_auto_select, dict):
+            settings["latency_test"] = {
+                "timeout_ms": legacy_auto_select.get("delay_timeout_ms", 5000),
+                "test_url": legacy_auto_select.get("test_url", "https://www.gstatic.com/generate_204"),
+            }
 
     for section, defaults in merged.items():
         incoming = settings.get(section, {})
@@ -90,12 +93,14 @@ def _merge_defaults(settings: dict) -> dict:
             if key in incoming:
                 merged[section][key] = incoming[key]
 
-    test_url = str(merged.get("auto_select", {}).get("test_url") or "")
+    test_url = str(merged.get("latency_test", {}).get("test_url") or "")
     if test_url in {
         "http://www.gstatic.com/generate_204",
         "http://www.google.com/generate_204",
     }:
-        merged["auto_select"]["test_url"] = "https://www.gstatic.com/generate_204"
+        merged["latency_test"]["test_url"] = "https://www.gstatic.com/generate_204"
+    merged.pop("auto_select", None)
+    merged.pop("auto_selector", None)
 
     return merged
 
@@ -115,7 +120,7 @@ def _is_port(value) -> bool:
 
 def validate_settings(settings: dict) -> tuple[bool, str | None]:
     proxy = settings.get("proxy", {})
-    auto_selector = settings.get("auto_select", {})
+    latency_test = settings.get("latency_test", {})
 
     if not str(proxy.get("listen_host", "")).strip():
         return False, "\u672c\u5730\u76d1\u542c\u5730\u5740\u4e0d\u80fd\u4e3a\u7a7a"
@@ -136,16 +141,10 @@ def validate_settings(settings: dict) -> tuple[bool, str | None]:
     if mihomo.get("controller_port") == mihomo.get("mixed_port"):
         return False, "mihomo controller 端口和 mixed-port 不能相同"
 
-    if not isinstance(auto_selector.get("check_interval"), int) or auto_selector["check_interval"] < 5:
-        return False, "\u5f53\u524d\u8282\u70b9\u68c0\u6d4b\u95f4\u9694\u5fc5\u987b\u5927\u4e8e\u7b49\u4e8e 5"
-
-    if not isinstance(auto_selector.get("max_fail_count"), int) or auto_selector["max_fail_count"] < 1:
-        return False, "\u8fde\u7eed\u5931\u8d25\u6b21\u6570\u5fc5\u987b\u5927\u4e8e\u7b49\u4e8e 1"
-
-    if not isinstance(auto_selector.get("delay_timeout_ms"), int) or auto_selector["delay_timeout_ms"] < 1000:
+    if not isinstance(latency_test.get("timeout_ms"), int) or latency_test["timeout_ms"] < 1000:
         return False, "\u5ef6\u8fdf\u6d4b\u8bd5\u8d85\u65f6\u5fc5\u987b\u5927\u4e8e\u7b49\u4e8e 1000 ms"
 
-    if not str(auto_selector.get("test_url", "")).strip():
+    if not str(latency_test.get("test_url", "")).strip():
         return False, "\u6d4b\u8bd5 URL \u4e0d\u80fd\u4e3a\u7a7a"
 
     return True, None

@@ -5,7 +5,7 @@ import re
 import socket
 import time
 
-from PySide6.QtCore import QObject, Qt, QThread, QTimer, Signal
+from PySide6.QtCore import QEvent, QObject, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QAction, QColor, QFont, QIcon, QPainter, QPen, QPixmap, QTextCursor
 from PySide6.QtWidgets import (
     QApplication,
@@ -50,7 +50,7 @@ from gui.auto_selector_store import (
     get_selected_node_for_group,
     load_runtime_selected_nodes,
 )
-from gui.dashboard_store import count_active_connections, get_dashboard_stats
+from gui.dashboard_store import count_active_connections, get_core_events, get_dashboard_stats
 from gui.notification import show_error_animation, show_success_animation, show_warning_animation
 from gui.process_manager import (
     cleanup_proxy_residue,
@@ -86,7 +86,7 @@ from gui.theme import APP_QSS, DANGER, MUTED, PRIMARY, SUCCESS, TEXT
 from gui.widgets.proxy_switch import ProxySwitch
 from backend.port_manager import prepare_mihomo_runtime_ports
 from backend.delay_tester import cancel_delay_test, test_all_node_delays_via_main_controller
-from backend.activity_bus import set_activity_callback
+from backend.activity_bus import set_activity_callback, write_log
 from backend.paths import PROJECT_ROOT
 
 
@@ -110,6 +110,7 @@ class ProxyActionWorker(QObject):
     def run(self):
         try:
             if self.action == "start":
+                write_log("lifecycle", "start_proxy_process called, reason=proxy_switch_or_tray_start")
                 ok, error = start_proxy_process()
                 if ok and load_app_settings().get("ui", {}).get("enable_system_proxy_on_start", True):
                     proxy_settings = load_app_settings().get("proxy", {})
@@ -118,8 +119,10 @@ class ProxyActionWorker(QObject):
                         port = int(proxy_settings.get("listen_port") or 18000)
                     except (TypeError, ValueError):
                         port = 18000
+                    write_log("lifecycle", f"enable_system_proxy called, reason=start_proxy_worker, endpoint={host}:{port}")
                     proxy_ok, proxy_message = enable_system_proxy(host, port)
                     if not proxy_ok:
+                        write_log("lifecycle", "stop_proxy_process called, reason=start_proxy_system_proxy_enable_failed")
                         stop_proxy_process()
                         ok = False
                         error = proxy_message or "系统代理启用失败"
@@ -131,10 +134,12 @@ class ProxyActionWorker(QObject):
                         port = int(proxy_settings.get("listen_port") or 18000)
                     except (TypeError, ValueError):
                         port = 18000
+                    write_log("lifecycle", f"disable_system_proxy called, reason=stop_proxy_worker, endpoint={host}:{port}")
                     proxy_ok, proxy_message = disable_system_proxy_if_contextproxy(host, port)
                     if not proxy_ok:
                         self.finished.emit(self.action, False, proxy_message or "系统代理关闭失败")
                         return
+                write_log("lifecycle", "stop_proxy_process called, reason=proxy_switch_or_tray_stop")
                 ok, error = stop_proxy_process()
             self.finished.emit(self.action, ok, error or "")
         except Exception as exc:
@@ -231,6 +236,9 @@ class MainWindow(QMainWindow):
         self._last_backend_error_seen = None
         self._residue_cleanup_done = False
         self._node_pool_last_loaded_count = None
+        self._last_core_event_id = 0
+        self._last_core_boot_id = None
+        self._routing_activity_seen = {}
         self._max_recent_activities = int(
             load_app_settings().get("logging", {}).get("max_recent_activities") or 200
         )
@@ -254,6 +262,30 @@ class MainWindow(QMainWindow):
         super().resizeEvent(event)
         if self.loading_overlay and self.loading_overlay.isVisible():
             self.loading_overlay.setGeometry(self.rect())
+
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        if event.type() != QEvent.WindowStateChange:
+            return
+        if self._force_real_close:
+            return
+        if not load_app_settings().get("ui", {}).get("close_to_tray", True):
+            return
+        if self.windowState() & Qt.WindowMinimized:
+            QTimer.singleShot(0, self._hide_to_tray_from_minimize)
+
+    def _log_lifecycle_event(self, message: str, level: str = "INFO"):
+        write_log("lifecycle", message, level)
+
+    def _hide_to_tray_from_minimize(self):
+        if self._force_real_close:
+            return
+        if not load_app_settings().get("ui", {}).get("close_to_tray", True):
+            return
+        self.hide()
+        self._update_tray_status()
+        self._log_lifecycle_event("window minimized to tray; backend/service/proxy unchanged")
+        self._append_activity_log("[INFO] 窗口已最小化到系统托盘")
 
     def start_busy(self, message="正在处理...", task_name: str | None = None):
         self.busy = True
@@ -572,7 +604,11 @@ class MainWindow(QMainWindow):
         self._refresh_active_connection_count()
 
         if running:
+            self._poll_core_route_events()
             self._residue_cleanup_done = False
+            return
+
+        if state not in {"stopped", "failed"}:
             return
 
         error = get_backend_error()
@@ -580,11 +616,92 @@ class MainWindow(QMainWindow):
             self._last_backend_error_seen = error
             self.notify_error(f"后端服务已停止：{error}")
 
-        self._disable_system_proxy_on_exit()
-
         if not self._residue_cleanup_done:
+            self._log_lifecycle_event(f"runtime poll observed backend state={state}; cleanup allowed", "WARN")
+            self._disable_system_proxy_on_exit()
             cleanup_proxy_residue()
             self._residue_cleanup_done = True
+
+    def _poll_core_route_events(self):
+        payload = get_core_events(self._last_core_event_id, limit=80)
+        boot_id = payload.get("boot_id")
+        if boot_id and boot_id != self._last_core_boot_id:
+            self.reset_core_event_cursor(boot_id)
+            payload = get_core_events(None, limit=80)
+            boot_id = payload.get("boot_id") or boot_id
+            self._last_core_boot_id = boot_id
+
+        events = payload.get("events", [])
+        if not events:
+            return
+
+        now = time.monotonic()
+        for event in events:
+            try:
+                event_id = int(event.get("id") or 0)
+            except Exception:
+                event_id = 0
+            if event_id > self._last_core_event_id:
+                self._last_core_event_id = event_id
+
+            if event.get("action") != "route":
+                continue
+
+            message = self._format_core_route_event(event)
+            if not message:
+                continue
+
+            key = (
+                str(event.get("source") or ""),
+                str(event.get("tab_host") or ""),
+                str(event.get("process_name") or ""),
+                str(event.get("request_host") or ""),
+                str(event.get("final_group") or ""),
+            )
+            ttl = 20 if str(event.get("final_group") or "").lower() == "direct" else 8
+            last_seen = self._routing_activity_seen.get(key, 0)
+            if now - last_seen < ttl:
+                continue
+            self._routing_activity_seen[key] = now
+            self._append_activity_log(message, "INFO")
+
+        if len(self._routing_activity_seen) > 300:
+            cutoff = now - 60
+            self._routing_activity_seen = {
+                key: ts for key, ts in self._routing_activity_seen.items() if ts >= cutoff
+            }
+
+    def reset_core_event_cursor(self, boot_id=None):
+        self._last_core_event_id = 0
+        self._last_core_boot_id = boot_id
+        self._routing_activity_seen.clear()
+
+    def _format_core_route_event(self, event: dict) -> str:
+        source = str(event.get("source") or "").lower()
+        reason = str(event.get("source_reason") or "")
+        tab_host = str(event.get("tab_host") or "").strip()
+        request_host = str(event.get("request_host") or "").strip()
+        process_name = str(event.get("process_name") or "").strip()
+        final_group = str(event.get("final_group") or "").strip()
+        matched_pattern = str(event.get("matched_pattern") or "").strip()
+
+        if not request_host or not final_group:
+            return ""
+
+        if source == "tab":
+            suffix = f"（{matched_pattern}）" if matched_pattern else ""
+            return f"Tab 分流：{tab_host or '-'} / {request_host} -> {final_group}{suffix}"
+        if source == "process":
+            suffix = f"（{matched_pattern}）" if matched_pattern else ""
+            return f"App 分流：{process_name or '-'} / {request_host} -> {final_group}{suffix}"
+        if source == "domain":
+            suffix = f"（{matched_pattern}）" if matched_pattern else ""
+            return f"域名分流：{request_host} -> {final_group}{suffix}"
+        if final_group.lower() == "direct":
+            if reason == "tab_report_no_rule" and tab_host:
+                return f"直连：{tab_host} / {request_host} -> Direct"
+            return f"直连：{request_host} -> Direct"
+        return f"分流：{request_host} -> {final_group}"
 
     def _append_auto_selector_status_logs(self):
         selected_nodes = load_runtime_selected_nodes()
@@ -724,6 +841,7 @@ class MainWindow(QMainWindow):
     def _on_proxy_action_finished(self, action: str, ok: bool, error: str):
         if action == "start":
             if not ok:
+                self._log_lifecycle_event("cleanup_proxy_residue called, reason=start_proxy_failed", "WARN")
                 cleanup_proxy_residue()
                 self._disable_system_proxy_on_exit()
                 self.refresh_dashboard()
@@ -733,6 +851,7 @@ class MainWindow(QMainWindow):
                 return
 
             self._residue_cleanup_done = False
+            self.reset_core_event_cursor()
             self._set_proxy_status(True)
             self.finish_busy(True, "代理已启动")
             self._append_activity_log("后端服务：内置运行中")
@@ -747,6 +866,7 @@ class MainWindow(QMainWindow):
             return
 
         self._set_proxy_status(False)
+        self.reset_core_event_cursor()
         self.finish_busy(True, "代理已停止")
 
     def _cleanup_proxy_action_thread(self):
@@ -787,6 +907,7 @@ class MainWindow(QMainWindow):
             return True
 
         host, port = self._context_proxy_endpoint()
+        self._log_lifecycle_event(f"enable_system_proxy called, reason=start_proxy, endpoint={host}:{port}")
         ok, message = enable_system_proxy(host, port)
         if not ok:
             self.notify_error(f"启用系统代理失败：{message}")
@@ -800,6 +921,7 @@ class MainWindow(QMainWindow):
             return True
 
         host, port = self._context_proxy_endpoint()
+        self._log_lifecycle_event(f"disable_system_proxy called, reason=stop_proxy, endpoint={host}:{port}")
         if is_contextproxy_system_proxy("127.0.0.1", 18000):
             ok, message = disable_system_proxy_if_contextproxy("127.0.0.1", 18000)
             if not ok:
@@ -825,6 +947,7 @@ class MainWindow(QMainWindow):
             return
 
         if is_contextproxy_system_proxy("127.0.0.1", 18000):
+            self._log_lifecycle_event("disable_system_proxy called, reason=startup_stale_proxy_cleanup, endpoint=127.0.0.1:18000")
             ok, _message = disable_system_proxy_if_contextproxy("127.0.0.1", 18000)
             if ok:
                 self._append_activity_log("[INFO] \u5df2\u6e05\u7406\u4e0a\u6b21\u6b8b\u7559\u7684\u7cfb\u7edf\u4ee3\u7406")
@@ -833,6 +956,7 @@ class MainWindow(QMainWindow):
         if not is_contextproxy_system_proxy(host, port):
             return
 
+        self._log_lifecycle_event(f"disable_system_proxy called, reason=startup_stale_proxy_cleanup, endpoint={host}:{port}")
         ok, _message = disable_system_proxy_if_contextproxy(host, port)
         if ok:
             self._append_activity_log("[INFO] \u5df2\u6e05\u7406\u4e0a\u6b21\u6b8b\u7559\u7684\u7cfb\u7edf\u4ee3\u7406")
@@ -842,10 +966,12 @@ class MainWindow(QMainWindow):
             return
 
         if is_contextproxy_system_proxy("127.0.0.1", 18000):
+            self._log_lifecycle_event("disable_system_proxy called, reason=exit_or_backend_stopped, endpoint=127.0.0.1:18000")
             disable_system_proxy_if_contextproxy("127.0.0.1", 18000)
             return
 
         host, port = self._context_proxy_endpoint()
+        self._log_lifecycle_event(f"disable_system_proxy called, reason=exit_or_backend_stopped, endpoint={host}:{port}")
         disable_system_proxy_if_contextproxy(host, port)
 
     def _append_mihomo_process_count(self):
@@ -930,6 +1056,7 @@ class MainWindow(QMainWindow):
             self._show_main_window_from_tray()
 
     def _show_main_window_from_tray(self):
+        self._log_lifecycle_event("tray show window")
         self.show()
         self.setWindowState(self.windowState() & ~Qt.WindowMinimized)
         self.raise_()
@@ -937,10 +1064,12 @@ class MainWindow(QMainWindow):
         self.refresh_dashboard()
 
     def _start_proxy_from_tray(self):
+        self._log_lifecycle_event("tray start proxy requested")
         self._start_proxy_from_gui()
         self._update_tray_status()
 
     def _stop_proxy_from_tray(self):
+        self._log_lifecycle_event("tray stop proxy requested")
         self._stop_proxy_from_gui()
         self._update_tray_status()
 
@@ -949,6 +1078,7 @@ class MainWindow(QMainWindow):
             self.notify_info("任务处理中，请稍候")
             return
 
+        self._log_lifecycle_event("tray exit requested")
         self._force_real_close = True
 
         if is_proxy_running():
@@ -964,6 +1094,7 @@ class MainWindow(QMainWindow):
                 return
             if result == QMessageBox.Yes:
                 self._disable_system_proxy_on_exit()
+                self._log_lifecycle_event("stop_proxy_process called, reason=tray_exit")
                 ok, error = stop_proxy_process()
                 if not ok:
                     self.notify_error(error or "代理停止失败")
@@ -2212,7 +2343,7 @@ class MainWindow(QMainWindow):
             self.process_group_combo = group_combo
             self.process_name_input = value_input
         else:
-            value_input.setPlaceholderText("*.openai.com")
+            value_input.setPlaceholderText("*.example.com")
             form.addWidget(QLabel("\u5339\u914d\u89c4\u5219"), 1, 0)
             form.addWidget(value_input, 1, 1, 1, 2)
             self.domain_group_combo = group_combo
@@ -2520,20 +2651,30 @@ class MainWindow(QMainWindow):
 
     def _reload_domain_rules_immediately(self) -> tuple[set[str], set[str]]:
         try:
-            from backend.batch_processor import reload_domain_file_now
+            from backend.core_launcher import reload_core_config
+            from backend.connection_closer import close_changed_groups
 
-            changed_groups, changed_patterns = reload_domain_file_now()
-            return set(changed_groups or set()), set(changed_patterns or set())
+            reload_core_config()
+            rules = load_domain_rules()
+            changed_groups = {group for group, _pattern in rules}
+            if changed_groups:
+                close_changed_groups(changed_groups)
+            return changed_groups, {pattern for _group, pattern in rules}
         except Exception as exc:
             _ = exc
             return set(), set()
 
     def _reload_process_rules_immediately(self) -> tuple[set[str], set[str]]:
         try:
-            from backend.app_process_rules import reload_app_process_file_now
+            from backend.core_launcher import reload_core_config
+            from backend.connection_closer import close_changed_groups
 
-            changed_groups, changed_patterns = reload_app_process_file_now()
-            return set(changed_groups or set()), set(changed_patterns or set())
+            reload_core_config()
+            rules = load_process_rules()
+            changed_groups = {group for group, _process in rules}
+            if changed_groups:
+                close_changed_groups(changed_groups)
+            return changed_groups, {process for _group, process in rules}
         except Exception as exc:
             _ = exc
             return set(), set()
@@ -2563,12 +2704,10 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(
             self._settings_form_card(
-                "\u81ea\u52a8\u9009\u62e9\u7b56\u7565",
+                "\u8282\u70b9\u6c60\u624b\u52a8\u6d4b\u901f",
                 [
-                    ("auto_select.check_interval", "\u5f53\u524d\u8282\u70b9\u68c0\u6d4b\u95f4\u9694\uff08\u79d2\uff09"),
-                    ("auto_select.max_fail_count", "\u8fde\u7eed\u5931\u8d25\u6b21\u6570"),
-                    ("auto_select.delay_timeout_ms", "\u5ef6\u8fdf\u6d4b\u8bd5\u8d85\u65f6\uff08ms\uff09"),
-                    ("auto_select.test_url", "\u6d4b\u8bd5 URL"),
+                    ("latency_test.timeout_ms", "\u624b\u52a8\u6d4b\u901f\u8d85\u65f6\uff08ms\uff09"),
+                    ("latency_test.test_url", "\u624b\u52a8\u6d4b\u901f URL"),
                 ],
                 settings,
             )
@@ -2652,11 +2791,9 @@ class MainWindow(QMainWindow):
         previous_settings = load_app_settings()
         listen_port = self._read_int_setting("proxy.listen_port", "\u672c\u5730\u4ee3\u7406\u7aef\u53e3")
         receiver_port = self._read_int_setting("proxy.receiver_port", "Tab \u4e0a\u62a5\u63a5\u6536\u7aef\u53e3")
-        check_interval = self._read_int_setting("auto_select.check_interval", "\u5f53\u524d\u8282\u70b9\u68c0\u6d4b\u95f4\u9694")
-        max_fail_count = self._read_int_setting("auto_select.max_fail_count", "\u8fde\u7eed\u5931\u8d25\u6b21\u6570")
-        delay_timeout_ms = self._read_int_setting("auto_select.delay_timeout_ms", "\u5ef6\u8fdf\u6d4b\u8bd5\u8d85\u65f6")
+        delay_timeout_ms = self._read_int_setting("latency_test.timeout_ms", "\u624b\u52a8\u6d4b\u901f\u8d85\u65f6")
 
-        if None in (listen_port, receiver_port, check_interval, max_fail_count, delay_timeout_ms):
+        if None in (listen_port, receiver_port, delay_timeout_ms):
             return
 
         settings = {
@@ -2665,11 +2802,9 @@ class MainWindow(QMainWindow):
                 "listen_port": listen_port,
                 "receiver_port": receiver_port,
             },
-            "auto_select": {
-                "check_interval": check_interval,
-                "max_fail_count": max_fail_count,
-                "delay_timeout_ms": delay_timeout_ms,
-                "test_url": self.setting_inputs["auto_select.test_url"].text().strip(),
+            "latency_test": {
+                "timeout_ms": delay_timeout_ms,
+                "test_url": self.setting_inputs["latency_test.test_url"].text().strip(),
             },
             "mihomo": previous_settings.get("mihomo", {}),
             "ui": {
@@ -2710,10 +2845,6 @@ class MainWindow(QMainWindow):
         watched_keys = [
             ("proxy", "listen_port"),
             ("proxy", "receiver_port"),
-            ("auto_select", "check_interval"),
-            ("auto_select", "max_fail_count"),
-            ("auto_select", "delay_timeout_ms"),
-            ("auto_select", "test_url"),
         ]
 
         for section, key in watched_keys:
@@ -2845,6 +2976,7 @@ class MainWindow(QMainWindow):
             self._disable_system_proxy_on_exit()
             if is_proxy_running() or get_proxy_state() in {"starting", "stopping", "failed"}:
                 try:
+                    self._log_lifecycle_event("stop_proxy_process called, reason=real_close_event")
                     stop_proxy_process()
                 except Exception as exc:
                     self._append_activity_log(f"[WARN] 退出时停止后端失败：{exc}")
@@ -2859,6 +2991,7 @@ class MainWindow(QMainWindow):
             event.ignore()
             self.hide()
             self._update_tray_status()
+            self._log_lifecycle_event("window close ignored, hidden to tray; backend/service/proxy unchanged")
             self._append_activity_log("[INFO] 窗口已最小化到系统托盘")
             return
 
@@ -2884,6 +3017,7 @@ class MainWindow(QMainWindow):
         if result == QMessageBox.Yes:
             self._disable_system_proxy_on_exit()
 
+            self._log_lifecycle_event("stop_proxy_process called, reason=close_event_exit_confirmed")
             ok, error = stop_proxy_process()
             if not ok:
                 self.notify_error(error or "代理停止失败")

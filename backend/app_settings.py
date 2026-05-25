@@ -14,10 +14,8 @@ def get_default_app_settings() -> dict:
             "listen_port": 18000,
             "receiver_port": 17890,
         },
-        "auto_select": {
-            "check_interval": 20,
-            "max_fail_count": 2,
-            "delay_timeout_ms": 5000,
+        "latency_test": {
+            "timeout_ms": 5000,
             "test_url": "https://www.gstatic.com/generate_204",
         },
         "mihomo": {
@@ -91,30 +89,30 @@ def load_app_settings() -> dict:
         settings["proxy"]["listen_port"] = _to_int(proxy.get("listen_port"), defaults["proxy"]["listen_port"], 1, 65535)
         settings["proxy"]["receiver_port"] = _to_int(proxy.get("receiver_port"), defaults["proxy"]["receiver_port"], 1, 65535)
 
-    auto_select = raw.get("auto_select", raw.get("auto_selector", {}))
-    if isinstance(auto_select, dict):
-        settings["auto_select"]["check_interval"] = _to_int(
-            auto_select.get("check_interval"),
-            defaults["auto_select"]["check_interval"],
-            5,
-        )
-        settings["auto_select"]["max_fail_count"] = _to_int(
-            auto_select.get("max_fail_count"),
-            defaults["auto_select"]["max_fail_count"],
-            1,
-        )
-        settings["auto_select"]["delay_timeout_ms"] = _to_int(
-            auto_select.get("delay_timeout_ms"),
-            defaults["auto_select"]["delay_timeout_ms"],
-            1000,
-        )
-        test_url = str(auto_select.get("test_url") or defaults["auto_select"]["test_url"])
-        if test_url in {
-            "http://www.gstatic.com/generate_204",
-            "http://www.google.com/generate_204",
-        }:
-            test_url = "https://www.gstatic.com/generate_204"
-        settings["auto_select"]["test_url"] = test_url
+    latency_test = raw.get("latency_test", {})
+    legacy_auto_select = raw.get("auto_select", raw.get("auto_selector", {}))
+    if not isinstance(latency_test, dict):
+        latency_test = {}
+    if not isinstance(legacy_auto_select, dict):
+        legacy_auto_select = {}
+
+    timeout_value = latency_test.get("timeout_ms", legacy_auto_select.get("delay_timeout_ms"))
+    settings["latency_test"]["timeout_ms"] = _to_int(
+        timeout_value,
+        defaults["latency_test"]["timeout_ms"],
+        1000,
+    )
+    test_url = str(
+        latency_test.get("test_url")
+        or legacy_auto_select.get("test_url")
+        or defaults["latency_test"]["test_url"]
+    )
+    if test_url in {
+        "http://www.gstatic.com/generate_204",
+        "http://www.google.com/generate_204",
+    }:
+        test_url = "https://www.gstatic.com/generate_204"
+    settings["latency_test"]["test_url"] = test_url
 
     mihomo = raw.get("mihomo", {})
     if isinstance(mihomo, dict):
@@ -160,8 +158,8 @@ def get_proxy_settings() -> dict:
     return load_app_settings()["proxy"]
 
 
-def get_auto_select_settings() -> dict:
-    return load_app_settings()["auto_select"]
+def get_latency_test_settings() -> dict:
+    return load_app_settings()["latency_test"]
 
 
 def get_mihomo_settings() -> dict:

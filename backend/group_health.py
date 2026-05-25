@@ -19,7 +19,6 @@ RECOVERY_COOLDOWN_SECONDS = 60
 _traffic_windows: dict[str, deque[bool]] = defaultdict(lambda: deque(maxlen=TRAFFIC_WINDOW_SIZE))
 _consecutive_failures: dict[str, int] = defaultdict(int)
 _listener_failures: dict[str, int] = defaultdict(int)
-_node_failures: dict[str, int] = defaultdict(int)
 _controller_failures = 0
 _healing_groups: set[str] = set()
 _recovery_tasks: set[asyncio.Task] = set()
@@ -40,21 +39,29 @@ def record_proxy_connection_result(group_name: str, success: bool, reason: str =
         return
 
     _consecutive_failures[group_name] += 1
+    fail_count = window.count(False)
+    fail_rate = fail_count / max(1, len(window))
     write_log(
-        "tcp",
+        "group_health",
         f"group traffic failure: group={group_name}, reason={reason or '-'}, "
-        f"consecutive={_consecutive_failures[group_name]}",
+        f"recent_total={len(window)}, recent_fail_count={fail_count}, "
+        f"recent_failure_rate={fail_rate:.2f}, consecutive={_consecutive_failures[group_name]}",
         "WARN",
     )
 
+    if _should_recover_from_traffic(group_name):
+        _schedule_group_recovery(group_name, f"traffic:{reason or 'unknown'}")
+
+
+def _should_recover_from_traffic(group_name: str) -> bool:
+    window = _traffic_windows[group_name]
     fail_count = window.count(False)
     fail_rate = fail_count / max(1, len(window))
-    if (
+    return (
         len(window) >= TRAFFIC_WINDOW_SIZE
         and fail_count >= TRAFFIC_FAIL_THRESHOLD
         and fail_rate >= TRAFFIC_FAIL_RATE_THRESHOLD
-    ) or _consecutive_failures[group_name] >= TRAFFIC_CONSECUTIVE_FAIL_THRESHOLD:
-        _schedule_group_recovery(group_name, f"traffic:{reason or 'unknown'}")
+    ) or _consecutive_failures[group_name] >= TRAFFIC_CONSECUTIVE_FAIL_THRESHOLD
 
 
 def _schedule_group_recovery(group_name: str, reason: str):
@@ -77,6 +84,10 @@ def _schedule_group_recovery(group_name: str, reason: str):
     task.add_done_callback(_recovery_tasks.discard)
 
 
+def schedule_group_recovery(group_name: str, reason: str):
+    _schedule_group_recovery(group_name, reason)
+
+
 def _listener_available(port: int) -> bool:
     try:
         with socket.create_connection(("127.0.0.1", int(port)), timeout=1.5):
@@ -91,7 +102,7 @@ async def start_group_health_monitor():
         return
     _running = True
     _monitor_task = asyncio.current_task()
-    write_log("group_health", f"started, interval={MONITOR_INTERVAL_SECONDS}s")
+    write_log("group_health", f"started, interval={MONITOR_INTERVAL_SECONDS}s, node_delay_health=disabled")
 
     while _running:
         await asyncio.sleep(MONITOR_INTERVAL_SECONDS)
@@ -113,6 +124,7 @@ def stop_group_health_monitor():
 
 
 async def check_all_groups_once():
+    """Check only infrastructure health, not node delay health."""
     global _controller_failures
 
     from backend.mihomo_controller import is_controller_available
@@ -132,48 +144,22 @@ async def check_all_groups_once():
     for group_name, port in port_map.items():
         if _listener_available(port):
             _listener_failures[group_name] = 0
-        else:
-            _listener_failures[group_name] += 1
-            failed_listeners.append(group_name)
-            write_log(
-                "group_health",
-                f"{group_name} listener failed {_listener_failures[group_name]}/{LISTENER_FAIL_THRESHOLD}: {port}",
-                "WARN",
-            )
+            continue
 
-        node_ok = await asyncio.to_thread(_current_node_healthy, group_name)
-        if node_ok is True:
-            _node_failures[group_name] = 0
-        elif node_ok is False:
-            _node_failures[group_name] += 1
-            write_log(
-                "group_health",
-                f"{group_name} current node failed {_node_failures[group_name]}/{LISTENER_FAIL_THRESHOLD}",
-                "WARN",
-            )
+        _listener_failures[group_name] += 1
+        failed_listeners.append(group_name)
+        write_log(
+            "group_health",
+            f"{group_name} listener failed {_listener_failures[group_name]}/{LISTENER_FAIL_THRESHOLD}: {port}",
+            "WARN",
+        )
+        if _listener_failures[group_name] >= LISTENER_FAIL_THRESHOLD:
+            _schedule_group_recovery(group_name, "listener_unavailable")
 
-        if (
-            _listener_failures[group_name] >= LISTENER_FAIL_THRESHOLD
-            or _node_failures[group_name] >= LISTENER_FAIL_THRESHOLD
-        ):
-            _schedule_group_recovery(group_name, "periodic health check")
-
-    if len(failed_listeners) >= 2 and all(_listener_failures[group] >= LISTENER_FAIL_THRESHOLD for group in failed_listeners):
+    if len(failed_listeners) >= 2 and all(
+        _listener_failures[group] >= LISTENER_FAIL_THRESHOLD for group in failed_listeners
+    ):
         await restart_mihomo_core_safely(f"multiple listeners unavailable: {failed_listeners}")
-
-
-def _current_node_healthy(group_name: str) -> bool | None:
-    try:
-        from backend.app_settings import get_mihomo_controller_port
-        from backend.auto_selector import get_current_node_for_group, is_current_node_healthy
-
-        node_name = get_current_node_for_group(group_name)
-        if not node_name:
-            return None
-        return is_current_node_healthy(get_mihomo_controller_port(), node_name)
-    except Exception as exc:
-        write_log("group_health", f"{group_name} current node check failed: {exc}", "WARN")
-        return None
 
 
 async def recover_group(group_name: str, reason: str):
@@ -181,12 +167,8 @@ async def recover_group(group_name: str, reason: str):
         write_log("group_health", f"{group_name} recovery started: {reason}", "WARN")
 
         from backend.connection_closer import close_changed_groups
-        from backend.mihomo_controller import close_all_mihomo_connections, close_mihomo_connections_by_group
 
         await asyncio.to_thread(close_changed_groups, {group_name})
-        closed_precise = await asyncio.to_thread(close_mihomo_connections_by_group, group_name)
-        if not closed_precise:
-            await asyncio.to_thread(close_all_mihomo_connections)
 
         listener_port = get_group_port_map().get(group_name)
         if listener_port and not _listener_available(listener_port):
@@ -194,9 +176,35 @@ async def recover_group(group_name: str, reason: str):
             _reset_group_stats(group_name)
             return
 
-        if await asyncio.to_thread(_current_node_healthy, group_name):
+        from backend.auto_selector import (
+            get_current_node_for_group,
+            mark_current_node_bad,
+            select_next_node_for_group,
+        )
+
+        is_real_traffic_failure = reason.startswith("go_core_metrics") or reason.startswith("traffic:")
+        previous_node = get_current_node_for_group(group_name)
+        if is_real_traffic_failure:
+            bad_node = await asyncio.to_thread(
+                mark_current_node_bad,
+                group_name,
+                f"real_traffic_failure:{reason}",
+            )
+            if bad_node:
+                window = _traffic_windows[group_name]
+                fail_count = window.count(False)
+                fail_rate = fail_count / max(1, len(window))
+                write_log(
+                    "group_health",
+                    f"{group_name} action=mark_bad_and_reselect current_node={bad_node} "
+                    f"recent_total={len(window)} recent_fail_count={fail_count} "
+                    f"recent_failure_rate={fail_rate:.2f} "
+                    f"consecutive_failures={_consecutive_failures[group_name]} reason={reason}",
+                    "WARN",
+                )
+        else:
             emit_activity(
-                "已自动优化连接状态",
+                f"{group_name} 已自动优化连接状态",
                 "INFO",
                 key=f"group-health:optimized:{group_name}",
                 ttl=120,
@@ -204,14 +212,11 @@ async def recover_group(group_name: str, reason: str):
             _reset_group_stats(group_name)
             return
 
-        from backend.auto_selector import get_current_node_for_group, select_best_node_for_group
-
-        previous_node = get_current_node_for_group(group_name)
-        selected_node = await asyncio.to_thread(select_best_node_for_group, group_name)
+        selected_node = await asyncio.to_thread(select_next_node_for_group, group_name, reason)
         if selected_node and selected_node != previous_node:
             await asyncio.to_thread(close_changed_groups, {group_name})
             emit_activity(
-                f"{group_name} 已自动切换节点：{selected_node}",
+                f"{group_name} 已根据真实流量故障切换节点：{selected_node}",
                 "INFO",
                 key=f"group-health:switch:{group_name}:{selected_node}",
                 ttl=120,
@@ -221,7 +226,7 @@ async def recover_group(group_name: str, reason: str):
 
         if selected_node:
             emit_activity(
-                "已自动优化连接状态",
+                f"{group_name} 已自动优化连接状态",
                 "INFO",
                 key=f"group-health:optimized:{group_name}",
                 ttl=120,
@@ -271,4 +276,3 @@ def _reset_group_stats(group_name: str):
     _traffic_windows[group_name].clear()
     _consecutive_failures[group_name] = 0
     _listener_failures[group_name] = 0
-    _node_failures[group_name] = 0

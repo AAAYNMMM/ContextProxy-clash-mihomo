@@ -2,6 +2,7 @@ from pathlib import Path
 import sys
 
 from backend.paths import PROJECT_ROOT
+from backend.activity_bus import write_log
 
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
@@ -42,15 +43,18 @@ def get_backend_error() -> str | None:
 
 
 def start_proxy_process() -> tuple[bool, str | None]:
+    write_log("lifecycle", "backend_service.start called via process_manager")
     return backend_service.start()
 
 
 def stop_proxy_process(timeout: float = 3.0) -> tuple[bool, str | None]:
     _ = timeout
+    write_log("lifecycle", "backend_service.stop called via process_manager")
     return backend_service.stop()
 
 
 def cleanup_proxy_residue():
+    write_log("lifecycle", "backend_service.cleanup_residue called via process_manager")
     backend_service.cleanup_residue()
 
 

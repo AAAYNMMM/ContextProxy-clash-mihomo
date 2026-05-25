@@ -72,11 +72,47 @@ def count_rules() -> int:
 
 def count_active_connections() -> int:
     try:
-        from backend.tcp_proxy import get_active_connection_count
+        from backend.core_config import get_core_listen_settings
+        from backend.core_launcher import is_core_running
+        from backend.local_http import local_get
 
-        return get_active_connection_count()
+        if is_core_running():
+            _proxy_host, _proxy_port, api_host, api_port = get_core_listen_settings()
+            response = local_get(f"http://{api_host}:{api_port}/metrics", timeout=0.3)
+            if response.status_code == 200:
+                data = response.json()
+                return int(data.get("active") or 0)
     except Exception:
-        return 0
+        pass
+
+    return 0
+
+
+def get_core_events(after_id: int | None = 0, limit: int = 100) -> dict:
+    try:
+        from backend.core_config import get_core_listen_settings
+        from backend.core_launcher import is_core_running
+        from backend.local_http import local_get
+
+        if not is_core_running():
+            return {"boot_id": None, "events": []}
+        _proxy_host, _proxy_port, api_host, api_port = get_core_listen_settings()
+        params = {"limit": int(limit or 100)}
+        if after_id is not None:
+            params["after_id"] = int(after_id or 0)
+        response = local_get(
+            f"http://{api_host}:{api_port}/events",
+            params=params,
+            timeout=0.5,
+        )
+        if response.status_code != 200:
+            return {"boot_id": None, "events": []}
+        data = response.json()
+        boot_id = data.get("boot_id") if isinstance(data, dict) else None
+        events = data.get("events", []) if isinstance(data, dict) else []
+        return {"boot_id": boot_id, "events": events if isinstance(events, list) else []}
+    except Exception:
+        return {"boot_id": None, "events": []}
 
 
 def get_dashboard_stats() -> dict[str, int]:

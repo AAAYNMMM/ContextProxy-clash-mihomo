@@ -6,7 +6,7 @@ from urllib.parse import quote
 
 import yaml
 
-from backend.app_settings import get_auto_select_settings, get_mihomo_controller_port
+from backend.app_settings import get_latency_test_settings, get_mihomo_controller_port
 from backend.local_http import local_get
 from backend.paths import CONFIG_DIR
 
@@ -16,7 +16,6 @@ MAX_WORKERS = 12
 DELAY_TEST_LOCK = threading.Lock()
 DELAY_TEST_CANCEL_EVENT = threading.Event()
 PRIMARY_HEALTH_CHECK_URL = "https://www.gstatic.com/generate_204"
-FALLBACK_HEALTH_CHECK_URL = "https://cp.cloudflare.com/generate_204"
 
 
 def _load_yaml(path: Path) -> dict:
@@ -39,8 +38,8 @@ def _load_node_pool() -> dict:
 
 
 def _test_url() -> str:
-    auto_settings = get_auto_select_settings()
-    test_url = str(auto_settings.get("test_url") or PRIMARY_HEALTH_CHECK_URL)
+    latency_settings = get_latency_test_settings()
+    test_url = str(latency_settings.get("test_url") or PRIMARY_HEALTH_CHECK_URL)
     if test_url in {
         "http://www.gstatic.com/generate_204",
         "http://www.google.com/generate_204",
@@ -49,18 +48,10 @@ def _test_url() -> str:
     return test_url
 
 
-def health_check_urls() -> list[str]:
-    urls = []
-    for url in (_test_url(), PRIMARY_HEALTH_CHECK_URL, FALLBACK_HEALTH_CHECK_URL):
-        if url and url not in urls:
-            urls.append(url)
-    return urls
-
-
 def _timeout_ms() -> int:
-    auto_settings = get_auto_select_settings()
+    latency_settings = get_latency_test_settings()
     try:
-        return int(auto_settings.get("delay_timeout_ms") or 5000)
+        return int(latency_settings.get("timeout_ms") or 5000)
     except (TypeError, ValueError):
         return 5000
 

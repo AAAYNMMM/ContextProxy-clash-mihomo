@@ -31,10 +31,8 @@ DEFAULT_APP_SETTINGS = {
         "mixed_port": 7899,
         "controller_port": 9090,
     },
-    "auto_select": {
-        "check_interval": 20,
-        "max_fail_count": 2,
-        "delay_timeout_ms": 5000,
+    "latency_test": {
+        "timeout_ms": 5000,
         "test_url": "https://www.gstatic.com/generate_204",
     },
     "ui": {
@@ -76,7 +74,7 @@ DEFAULT_GROUP_NODES = {
 DOMAIN_RULES_TEMPLATE = (
     "# Format: group,domain rule\n"
     "# Proxy,*.google.com\n"
-    "# AI,*.openai.com\n"
+    "# AI,*.example.com\n"
 )
 
 APP_RULES_TEMPLATE = (
@@ -140,12 +138,27 @@ def _merge_missing_defaults(existing, defaults):
 def ensure_app_settings_file() -> None:
     existing = _load_yaml(APP_SETTINGS_FILE)
     settings, changed = _merge_missing_defaults(existing, DEFAULT_APP_SETTINGS)
-    auto_select = settings.get("auto_select", {})
-    if isinstance(auto_select, dict) and auto_select.get("test_url") in {
+    latency_test = settings.get("latency_test", {})
+    legacy_auto_select = settings.get("auto_select", {})
+    if isinstance(legacy_auto_select, dict):
+        if "timeout_ms" not in latency_test and "delay_timeout_ms" in legacy_auto_select:
+            latency_test["timeout_ms"] = legacy_auto_select.get("delay_timeout_ms")
+            changed = True
+        if "test_url" not in latency_test and "test_url" in legacy_auto_select:
+            latency_test["test_url"] = legacy_auto_select.get("test_url")
+            changed = True
+    if isinstance(latency_test, dict) and latency_test.get("test_url") in {
         "http://www.gstatic.com/generate_204",
         "http://www.google.com/generate_204",
     }:
-        auto_select["test_url"] = "https://www.gstatic.com/generate_204"
+        latency_test["test_url"] = "https://www.gstatic.com/generate_204"
+        changed = True
+    settings["latency_test"] = latency_test
+    if "auto_select" in settings:
+        settings.pop("auto_select", None)
+        changed = True
+    if "auto_selector" in settings:
+        settings.pop("auto_selector", None)
         changed = True
     if changed or not APP_SETTINGS_FILE.is_file():
         settings["updated_at"] = _now_str()

@@ -102,14 +102,23 @@ def main():
 
     def _shutdown_backend_on_quit():
         try:
+            from backend.activity_bus import write_log
+
+            write_log("lifecycle", "QApplication aboutToQuit cleanup started")
+        except Exception:
+            pass
+
+        try:
             window._disable_system_proxy_on_exit()
         except Exception:
             pass
 
         try:
             from gui.process_manager import get_proxy_state, stop_proxy_process, cleanup_proxy_residue
+            from backend.activity_bus import write_log
 
             if get_proxy_state() in {"starting", "running", "stopping", "failed"}:
+                write_log("lifecycle", "stop_proxy_process called, reason=QApplication_aboutToQuit")
                 stop_proxy_process()
             else:
                 cleanup_proxy_residue()

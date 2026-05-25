@@ -1,22 +1,15 @@
-from pathlib import Path
 from datetime import datetime
+from pathlib import Path
+
 import yaml
 
 from backend.node_normalizer import normalize_proxy_node
 from backend.paths import CONFIG_DIR
 
 
-# ============================================================
-# 璺緞閰嶇疆
-# ============================================================
-
 SUBSCRIPTIONS_DIR = CONFIG_DIR / "subscriptions"
 NODE_POOL_FILE = CONFIG_DIR / "node_pool.yaml"
 
-
-# ============================================================
-# 宸ュ叿鍑芥暟
-# ============================================================
 
 def now_str() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -27,47 +20,36 @@ def load_yaml(path: Path, default):
         return default
 
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = yaml.safe_load(f)
+        with open(path, "r", encoding="utf-8") as file:
+            data = yaml.safe_load(file)
             return data if data is not None else default
-    except Exception as e:
-        print(f"[鑺傜偣姹燷 璇诲彇澶辫触: {path} | {e}")
+    except Exception as exc:
+        print(f"[node_pool] failed to read {path}: {exc}")
         return default
 
 
 def save_yaml(path: Path, data):
     path.parent.mkdir(parents=True, exist_ok=True)
-
-    with open(path, "w", encoding="utf-8") as f:
-        yaml.safe_dump(
-            data,
-            f,
-            allow_unicode=True,
-            sort_keys=False,
-        )
+    with open(path, "w", encoding="utf-8") as file:
+        yaml.safe_dump(data, file, allow_unicode=True, sort_keys=False)
 
 
 def load_subscription_nodes() -> list[dict]:
-    """
-    璇诲彇 config/subscriptions/*_nodes.yaml 閲岀殑鎵€鏈?proxies銆?
-    """
+    """Read all proxies from config/subscriptions/*_nodes.yaml."""
     if not SUBSCRIPTIONS_DIR.exists():
-        print(f"[鑺傜偣姹燷 璁㈤槄鑺傜偣鐩綍涓嶅瓨鍦? {SUBSCRIPTIONS_DIR}")
+        print(f"[node_pool] subscription node directory does not exist: {SUBSCRIPTIONS_DIR}")
         return []
 
     all_nodes = []
-
     files = sorted(SUBSCRIPTIONS_DIR.glob("*_nodes.yaml"))
 
     if not files:
-        print("[鑺傜偣姹燷 娌℃湁鎵惧埌浠讳綍璁㈤槄鑺傜偣鏂囦欢")
+        print("[node_pool] no subscription node files found")
         return []
 
     for file in files:
         data = load_yaml(file, {})
-
-        proxies = data.get("proxies", [])
-
+        proxies = data.get("proxies", []) if isinstance(data, dict) else []
         if not isinstance(proxies, list):
             continue
 
@@ -76,7 +58,6 @@ def load_subscription_nodes() -> list[dict]:
                 continue
 
             name = str(node.get("name", "")).strip()
-
             if not name:
                 continue
 
@@ -85,29 +66,15 @@ def load_subscription_nodes() -> list[dict]:
     return all_nodes
 
 
-# ============================================================
-# 鑺傜偣姹犵敓鎴?
-# ============================================================
-
 def rebuild_node_pool():
-    """
-    閲嶆柊鐢熸垚缁熶竴鑺傜偣姹犮€?
-
-    瑙勫垯锛?
-    1. 鑺傜偣鍚嶄綔涓哄敮涓€ key
-    2. 鍚屽悕鑺傜偣鍚庤鍙栫殑瑕嗙洊鍏堣鍙栫殑
-    3. 璁㈤槄鏂囦欢閲屾病鏈夌殑鏃ц妭鐐逛笉浼氫繚鐣?
-    """
+    """Rebuild config/node_pool.yaml from subscription node files."""
     nodes = load_subscription_nodes()
-
     node_map = {}
 
     for node in nodes:
         name = str(node.get("name", "")).strip()
-
         if not name:
             continue
-
         node_map[name] = normalize_proxy_node(node)
 
     output = {
@@ -119,13 +86,9 @@ def rebuild_node_pool():
     save_yaml(NODE_POOL_FILE, output)
 
     print("[node_pool] generated unified node pool")
-    print(f"[鑺傜偣姹燷 鑺傜偣鏁伴噺: {len(node_map)}")
-    print(f"[鑺傜偣姹燷 淇濆瓨浣嶇疆: {NODE_POOL_FILE}")
+    print(f"[node_pool] node count: {len(node_map)}")
+    print(f"[node_pool] saved to: {NODE_POOL_FILE}")
 
-
-# ============================================================
-# VSCode 鐩存帴杩愯鍏ュ彛
-# ============================================================
 
 if __name__ == "__main__":
     rebuild_node_pool()

@@ -7,17 +7,14 @@ import traceback
 from datetime import datetime
 from concurrent.futures import TimeoutError as FutureTimeoutError
 
-from backend.app_process_rules import load_app_process_file, start_app_process_watcher
-from backend.app_settings import get_mihomo_controller_port, get_proxy_settings
+from backend.app_settings import get_mihomo_controller_port
 from backend.auto_selector import start_auto_selector, stop_auto_selector
-from backend.batch_processor import init_request_queue, load_domain_file, start_batch_processor
+from backend.core_config import get_core_listen_settings
+from backend.core_launcher import core_health_ok, is_core_available, is_core_running, start_core, stop_core
 from backend.local_http import local_get
 from backend.mihomo_launcher import launch_mihomo_all, stop_all_mihomo
-from backend.paths import APP_PROCESSES_FILE, GROUPS_DOMAINS_FILE, LOGS_DIR
-from backend.process_cache import start_process_cache_watcher, stop_process_cache_watcher
+from backend.paths import LOGS_DIR
 from backend.group_health import start_group_health_monitor, stop_group_health_monitor
-from backend.receiver import start_receiver, stop_receiver
-from backend.tcp_proxy import async_stop_tcp_proxy, start_tcp_proxy, stop_tcp_proxy
 
 
 LOG_FILE = LOGS_DIR / "backend_service.log"
@@ -43,6 +40,8 @@ class BackendService:
         self._loop_ready_event = threading.Event()
         self._state_lock = threading.RLock()
         self._log_lock = threading.Lock()
+        self.core_mode = False
+        self._last_core_traffic_trigger: dict[str, tuple[int, int, int, int]] = {}
 
     def start(self) -> tuple[bool, str | None]:
         with self._state_lock:
@@ -139,6 +138,10 @@ class BackendService:
             self._set_failed("backend thread exited")
             return False
 
+        if self.core_mode and not is_core_running():
+            self._set_failed("contextproxy core exited")
+            return False
+
         return True
 
     def is_starting(self) -> bool:
@@ -147,6 +150,9 @@ class BackendService:
     def get_state(self) -> str:
         with self._state_lock:
             return self.state
+
+    def _is_stopping_or_stopped(self) -> bool:
+        return self.get_state() in {"stopping", "stopped", "failed"}
 
     def cleanup_residue(self):
         state = self.get_state()
@@ -184,10 +190,7 @@ class BackendService:
         return self.thread is not None and self.thread.is_alive()
 
     def _thread_main(self):
-        if sys.platform.startswith("win"):
-            self.loop = asyncio.SelectorEventLoop()
-        else:
-            self.loop = asyncio.new_event_loop()
+        self.loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self.loop)
         self._loop_ready_event.set()
 
@@ -250,12 +253,10 @@ class BackendService:
         self._set_state("starting")
         total_start = time.perf_counter()
         try:
-            step_start = time.perf_counter()
-            self.log("[BackendService] loading rules")
-            init_request_queue()
-            load_domain_file(str(GROUPS_DOMAINS_FILE))
-            load_app_process_file(str(APP_PROCESSES_FILE))
-            self.log(f"[BackendService] rules ready in {time.perf_counter() - step_start:.2f}s")
+            self.core_mode = is_core_available()
+            if not self.core_mode:
+                raise FileNotFoundError("core/contextproxy-core.exe 缺失，无法启动 Go core 数据面")
+            self.log("[BackendService] using Go core data plane")
 
             step_start = time.perf_counter()
             self.log("[BackendService] starting mihomo")
@@ -263,12 +264,10 @@ class BackendService:
             self.log(f"[BackendService] mihomo started in {time.perf_counter() - step_start:.2f}s")
 
             step_start = time.perf_counter()
-            self._create_task(start_batch_processor(), "batch_processor")
-            self._create_task(start_app_process_watcher(), "app_process_watcher")
-            self._create_task(start_process_cache_watcher(), "process_cache")
             self._create_task(start_group_health_monitor(), "group_health")
-            self._create_task(start_tcp_proxy(), "tcp_proxy")
-            self._create_task(start_receiver(), "receiver")
+            start_core()
+            self._create_task(self._monitor_core_process(), "contextproxy_core_monitor")
+            self._create_task(self._watch_core_metrics(), "contextproxy_core_metrics")
             self.log(f"[BackendService] async tasks scheduled in {time.perf_counter() - step_start:.2f}s")
 
             step_start = time.perf_counter()
@@ -310,16 +309,13 @@ class BackendService:
     async def _async_stop(self, final_state: str = "stopped"):
         self._set_state("stopping")
         await self._cleanup_services()
+        self.core_mode = False
+        self._last_core_traffic_trigger: dict[str, tuple[int, int, int, int]] = {}
         self._set_state(final_state)
         self.stopped_event.set()
 
     async def _cleanup_services(self):
         self.log("[BackendService] cleanup services")
-
-        try:
-            stop_process_cache_watcher()
-        except Exception as exc:
-            self.log(f"[BackendService] process cache stop failed: {exc}")
 
         try:
             stop_group_health_monitor()
@@ -331,20 +327,12 @@ class BackendService:
         except Exception as exc:
             self.log(f"[BackendService] auto selector stop failed: {exc}")
 
-        try:
-            stop_tcp_proxy()
-        except Exception as exc:
-            self.log(f"[BackendService] tcp_proxy stop failed: {exc}")
+        await self._cancel_tasks_by_name({"contextproxy_core_monitor", "contextproxy_core_metrics"})
 
         try:
-            await stop_receiver()
+            stop_core()
         except Exception as exc:
-            self.log(f"[BackendService] receiver stop failed: {exc}")
-
-        try:
-            await async_stop_tcp_proxy()
-        except Exception as exc:
-            self.log(f"[BackendService] tcp_proxy async stop failed: {exc}")
+            self.log(f"[BackendService] core stop failed: {exc}")
 
         for _ in range(10):
             pending_business_tasks = [task for task in self.tasks if not task.done()]
@@ -373,8 +361,20 @@ class BackendService:
         self.tasks.append(task)
         return task
 
+    async def _cancel_tasks_by_name(self, names: set[str]):
+        current_task = asyncio.current_task()
+        tasks = [
+            task
+            for task in self.tasks
+            if task is not current_task and not task.done() and task.get_name() in names
+        ]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
     def _on_task_done(self, task: asyncio.Task):
-        if self.get_state() in {"stopping", "stopped"} or task.cancelled():
+        if task.cancelled():
             return
 
         try:
@@ -382,7 +382,16 @@ class BackendService:
         except asyncio.CancelledError:
             return
 
+        if self._is_stopping_or_stopped():
+            if exc is not None:
+                self.log(f"[BackendService] {task.get_name()} ended during shutdown: {exc}")
+            return
+
         if exc is None:
+            self.last_error = f"{task.get_name()} exited unexpectedly"
+            self.log(f"[BackendService] {self.last_error}")
+            if self.loop and self.loop.is_running():
+                self.loop.create_task(self._stop_after_failure())
             return
 
         self.last_error = f"{task.get_name()} exited with error: {exc}"
@@ -428,20 +437,109 @@ class BackendService:
         return not self._health_waiting_items()
 
     def _health_waiting_items(self) -> list[str]:
-        proxy_settings = get_proxy_settings()
-        listen_host = str(proxy_settings.get("listen_host") or "127.0.0.1")
-        listen_port = int(proxy_settings.get("listen_port") or 18000)
-        receiver_port = int(proxy_settings.get("receiver_port") or 17890)
+        listen_host, listen_port, api_host, api_port = get_core_listen_settings()
         controller_port = get_mihomo_controller_port()
 
         waiting = []
         if not self._can_connect(listen_host, listen_port):
             waiting.append(f"tcp proxy port {listen_port}")
-        if not self._can_connect("127.0.0.1", receiver_port):
-            waiting.append(f"receiver port {receiver_port}")
+        if not self._can_connect(api_host, api_port):
+            waiting.append(f"core api port {api_port}")
+        if not core_health_ok(timeout=0.5):
+            waiting.append("contextproxy core /health")
         if not self._controller_ready(controller_port):
             waiting.append(f"mihomo controller {controller_port}")
         return waiting
+
+    async def _monitor_core_process(self):
+        failed_health_count = 0
+        while True:
+            await asyncio.sleep(2)
+            if self._is_stopping_or_stopped():
+                self.log("[BackendService] contextproxy core monitor stopped because backend is stopping")
+                return
+
+            if not is_core_running():
+                if self._is_stopping_or_stopped():
+                    self.log("[BackendService] contextproxy core monitor saw core exit during shutdown")
+                    return
+                raise RuntimeError("contextproxy core process exited")
+
+            health_ok = core_health_ok(timeout=0.8)
+            if self._is_stopping_or_stopped():
+                self.log("[BackendService] contextproxy core monitor stopped because backend is stopping")
+                return
+
+            if health_ok:
+                failed_health_count = 0
+                continue
+            failed_health_count += 1
+            self.log(f"[BackendService] contextproxy core health failed {failed_health_count}/3")
+            if failed_health_count >= 3:
+                if self._is_stopping_or_stopped():
+                    self.log("[BackendService] contextproxy core health failed during shutdown")
+                    return
+                raise RuntimeError("contextproxy core /health unavailable")
+
+    async def _watch_core_metrics(self):
+        from backend.group_health import schedule_group_recovery
+
+        while True:
+            await asyncio.sleep(5)
+            if not self.core_mode or not is_core_running():
+                continue
+
+            try:
+                _proxy_host, _proxy_port, api_host, api_port = get_core_listen_settings()
+                response = local_get(f"http://{api_host}:{api_port}/metrics", timeout=1)
+                if response.status_code != 200:
+                    continue
+                data = response.json()
+                traffic = data.get("traffic", {}) if isinstance(data, dict) else {}
+                if not isinstance(traffic, dict):
+                    continue
+
+                active_groups = set()
+                for group_name, stats in traffic.items():
+                    if not isinstance(stats, dict):
+                        continue
+                    group_key = str(group_name)
+                    active_groups.add(group_key)
+                    recent_total = int(stats.get("recent_total") or 0)
+                    recent_fail = int(stats.get("recent_fail_count") or 0)
+                    consecutive = int(stats.get("consecutive_failures") or 0)
+                    updated_at = int(stats.get("updated_at") or 0)
+                    fail_rate = recent_fail / max(1, recent_total)
+                    should_recover = (
+                        recent_total >= 20
+                        and recent_fail >= 8
+                        and fail_rate >= 0.40
+                    ) or consecutive >= 5
+
+                    if not should_recover:
+                        if consecutive == 0 or recent_fail == 0:
+                            self._last_core_traffic_trigger.pop(group_key, None)
+                        continue
+
+                    signature = (updated_at, recent_total, recent_fail, consecutive)
+                    if self._last_core_traffic_trigger.get(group_key) == signature:
+                        continue
+                    self._last_core_traffic_trigger[group_key] = signature
+
+                    self.log(
+                        "[BackendService] group real traffic failure: "
+                        f"group={group_name}, recent_total={recent_total}, "
+                        f"recent_fail_count={recent_fail}, "
+                        f"recent_failure_rate={fail_rate:.2f}, "
+                        f"consecutive_failures={consecutive}, updated_at={updated_at}"
+                    )
+                    schedule_group_recovery(group_key, "go_core_metrics")
+
+                for group_key in list(self._last_core_traffic_trigger):
+                    if group_key not in active_groups:
+                        self._last_core_traffic_trigger.pop(group_key, None)
+            except Exception as exc:
+                self.log(f"[BackendService] core metrics read failed: {exc}")
 
     @staticmethod
     def _can_connect(host: str, port: int) -> bool:
