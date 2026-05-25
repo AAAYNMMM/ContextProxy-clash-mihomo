@@ -4,11 +4,19 @@
 
 ContextProxy 的核心优势是“按上下文分流”，而不是传统代理客户端常见的单一全局代理或简单域名规则。它可以结合浏览器 Tab 上报、请求域名、App 进程规则，判断流量应该进入哪个分组，例如 Proxy、AI、Media 或用户自定义分组。
 
-这种方式更适合现代使用场景：
+## 客户端截图
 
-### 软件根据进程名进入不同分组，减少手动切换节点和规则维护成本。
+<img width="1220" height="801" alt="Snipaste_2026-05-26_02-17-57" src="https://github.com/user-attachments/assets/76adc12f-0eb5-4431-9a29-3bde5af5f71f" />
 
-### 在可添加扩展的浏览器中，规则仅仅只需要填写标签站的域名，网页内的静态and动态域名都会归于标签域名之下，极大减少了维护规则的成本。
+<img width="1220" height="801" alt="Snipaste_2026-05-26_02-18-30" src="https://github.com/user-attachments/assets/8ca99359-a895-4e3a-b366-8d8aebc6fa97" />
+
+<img width="1220" height="801" alt="Snipaste_2026-05-26_02-18-48" src="https://github.com/user-attachments/assets/e1f4455e-9359-482e-b700-f0534ef2afb3" />
+
+<img width="1220" height="801" alt="Snipaste_2026-05-26_02-19-12" src="https://github.com/user-attachments/assets/8a6ac435-4119-4ff6-bd25-3dcc98c47771" />
+
+<img width="1220" height="801" alt="Snipaste_2026-05-26_02-19-28" src="https://github.com/user-attachments/assets/35d2bb4d-be5a-4552-992a-859392e056f3" />
+
+<img width="1220" height="801" alt="Snipaste_2026-05-26_02-19-37" src="https://github.com/user-attachments/assets/c06f109d-9bf4-46fe-bbff-58f98fab5fe0" />
 
 ---
 
@@ -21,16 +29,14 @@ ContextProxy 的核心优势是“按上下文分流”，而不是传统代理�
 - 域名规则分流
 - 应用进程规则分流
 - 无规则流量默认 Direct
-- 命中代理分组后不降级 Direct
 - 订阅添加、更新、删除
 - 节点池管理与延迟测试
 - 动态分组管理
 - 规则管理
-- 自动选择当前分组最低延迟节点
+- 自动选择节点
 - 当前节点异常后自动重选当前分组节点
 - 系统托盘控制
 - 最近活动日志
-- 浏览器先启动、代理后启动时的补报机制
 
 ---
 
