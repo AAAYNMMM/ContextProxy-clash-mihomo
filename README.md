@@ -4,6 +4,8 @@
 
 ContextProxy 的核心优势是“按上下文分流”，而不是传统代理客户端常见的单一全局代理或简单域名规则。它可以结合浏览器 Tab 上报、请求域名、App 进程规则，判断流量应该进入哪个分组，例如 Proxy、AI、Media 或用户自定义分组。
 
+## 本客户端使用的是clash格式订阅链接
+
 ## 客户端截图
 
 <img width="1220" height="801" alt="Snipaste_2026-05-26_02-17-57" src="https://github.com/user-attachments/assets/76adc12f-0eb5-4431-9a29-3bde5af5f71f" />
