@@ -83,35 +83,57 @@ def add_subscription_prefix_to_node(node: dict, sub_name: str) -> dict:
     return normalize_proxy_node(new_node)
 
 
+def _proxy_list_from_yaml_data(data) -> list:
+    """Return a proxy list from common Clash/Mihomo subscription shapes."""
+    if isinstance(data, dict):
+        proxies = data.get("proxies", [])
+        return proxies if isinstance(proxies, list) else []
+
+    # Some provider exports are a plain YAML list of proxy objects.  Accepting
+    # that shape costs nothing and keeps the importer protocol-agnostic.
+    if isinstance(data, list):
+        return data
+
+    return []
+
+
 def extract_proxies_from_yaml(text: str, sub_name: str) -> list[dict]:
-    """Extract Clash/Mihomo proxies while preserving node fields."""
+    """Extract Clash/Mihomo proxies while preserving every node field.
+
+    Mihomo is responsible for protocol support.  ContextProxy should only
+    require the fields needed to identify a proxy in the UI/config: `name` and
+    `type`.  Do not require `server`/`port`, because some mihomo proxy types or
+    future protocols may not use the same shape, and mihomo's own config check
+    is the source of truth for protocol validity.
+    """
     try:
         data = yaml.safe_load(text)
     except Exception as exc:
         print(f"[subscription] YAML parse failed: {exc}")
         return []
 
-    if not isinstance(data, dict):
-        return []
-
-    proxies = data.get("proxies", [])
-    if not isinstance(proxies, list):
+    proxies = _proxy_list_from_yaml_data(data)
+    if not proxies:
         return []
 
     result = []
+    skipped = 0
     for node in proxies:
         if not isinstance(node, dict):
+            skipped += 1
             continue
 
         name = str(node.get("name", "")).strip()
         node_type = str(node.get("type", "")).strip()
-        server = str(node.get("server", "")).strip()
-        port = node.get("port")
 
-        if not name or not node_type or not server or not port:
+        if not name or not node_type:
+            skipped += 1
             continue
 
         result.append(add_subscription_prefix_to_node(node, sub_name))
+
+    if skipped:
+        print(f"[subscription] skipped invalid proxy entries: {skipped}")
 
     return result
 
@@ -120,11 +142,16 @@ def decode_subscription(url: str, sub_name: str) -> list[dict]:
     raw_text = fetch_subscription(url)
     decoded_text = try_base64_decode(raw_text)
 
-    if "proxies:" in decoded_text:
-        return extract_proxies_from_yaml(decoded_text, sub_name)
+    # Prefer mihomo/Clash YAML passthrough.  This is what makes protocol support
+    # future-proof: every proxy object under `proxies` is preserved and handed
+    # back to mihomo instead of being reduced to a fixed field schema.
+    nodes = extract_proxies_from_yaml(decoded_text, sub_name)
+    if nodes:
+        return nodes
 
-    print("[subscription] current parser mainly supports Clash/Mihomo YAML subscriptions")
-    print("[subscription] vmess://, ss://, trojan:// and vless:// line subscriptions are not converted yet")
+    print("[subscription] no Clash/Mihomo YAML proxies were extracted")
+    print("[subscription] to support all mihomo protocols, use subscriptions that expose a proxies YAML list")
+    print("[subscription] URI line subscriptions are not converted by ContextProxy")
     return []
 
 

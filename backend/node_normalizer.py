@@ -29,11 +29,17 @@ def _ensure_dict(value: Any) -> dict:
 
 
 def normalize_proxy_node(node: dict) -> dict:
-    """Normalize subscription proxy fields for mihomo without changing node identity.
+    """Return a mihomo proxy node while preserving protocol-specific fields.
 
-    The function is intentionally conservative: it preserves unknown fields, only
-    fills common aliases and compatibility defaults used by mihomo for VLESS
-    Reality/gRPC nodes.
+    ContextProxy does not implement proxy protocols itself; mihomo does.  This
+    normalizer therefore must never rebuild nodes from a fixed allow-list of
+    fields.  Unknown/new mihomo fields are intentionally kept so new protocols
+    and transport options continue to work as long as mihomo supports them.
+
+    Only tiny compatibility fixes are applied: common scalar normalization and
+    adding canonical aliases for VLESS URI-style nodes.  Alias/source fields are
+    not removed because Clash/Mihomo YAML subscriptions may already contain
+    protocol-specific keys that this project should pass through untouched.
     """
     if not isinstance(node, dict):
         return node
@@ -119,22 +125,6 @@ def normalize_proxy_node(node: dict) -> dict:
         proxy.setdefault("flow", "")
         if not proxy.get("alpn"):
             proxy["alpn"] = ["h2"]
-
-    # Remove alias-only keys after canonicalization. Preserve protocol fields.
-    for alias_key in (
-        "id",
-        "net",
-        "sni",
-        "peer",
-        "fp",
-        "pbk",
-        "sid",
-        "serviceName",
-        "service-name",
-        "host",
-        "path",
-    ):
-        proxy.pop(alias_key, None)
 
     return proxy
 
