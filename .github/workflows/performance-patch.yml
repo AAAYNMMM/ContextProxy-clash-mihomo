@@ -7,6 +7,12 @@ on:
     paths:
       - tools/apply_performance_patch.py
       - .github/workflows/performance-patch.yml
+  pull_request:
+    branches:
+      - main
+    paths:
+      - tools/apply_performance_patch.py
+      - .github/workflows/performance-patch.yml
 
 permissions:
   contents: write
@@ -19,6 +25,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: codex/performance-smoothness-p0-p2
 
       - uses: actions/setup-python@v5
         with:
@@ -70,6 +77,7 @@ jobs:
           }
 
       - name: Commit optimized implementation
+        if: github.event_name == 'push'
         shell: pwsh
         run: |
           git config user.name "github-actions[bot]"
