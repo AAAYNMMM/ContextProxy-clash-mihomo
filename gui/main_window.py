@@ -6,7 +6,7 @@ import socket
 import time
 
 from PySide6.QtCore import QEvent, QObject, Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QAction, QColor, QFont, QIcon, QPainter, QPen, QPixmap, QTextCursor
+from PySide6.QtGui import QAction, QColor, QFont, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractItemView,
@@ -33,7 +33,7 @@ from PySide6.QtWidgets import (
     QTabWidget,
     QTableWidget,
     QTableWidgetItem,
-    QTextEdit,
+    QPlainTextEdit,
     QVBoxLayout,
     QWidget,
 )
@@ -50,6 +50,7 @@ from gui.auto_selector_store import (
 )
 from gui.dashboard_store import count_active_connections, get_core_events, get_dashboard_stats
 from gui.notification import show_error_animation, show_success_animation, show_warning_animation
+from gui.runtime_poller import RuntimePollWorker
 from gui.process_manager import (
     cleanup_proxy_residue,
     count_mihomo_processes,
@@ -174,7 +175,7 @@ class MainWindow(QMainWindow):
 
         self.nav = QListWidget()
         self.pages = QStackedWidget()
-        self.activity_log = QTextEdit()
+        self.activity_log = QPlainTextEdit()
         self.subscription_name_input = None
         self.subscription_url_input = None
         self.subscription_table = None
@@ -235,6 +236,15 @@ class MainWindow(QMainWindow):
         self.tray_quit_action = None
         self._tray_notice_shown = False
         self._force_real_close = False
+        self._finalizing_exit = False
+        self._exit_after_proxy_stop = False
+        self.runtime_poll_thread = None
+        self.runtime_poll_worker = None
+        self._lazy_page_builders = {}
+        self._last_rendered_proxy_state = None
+        self._last_active_connection_count = 0
+        self._tray_icons = {}
+        self._last_tray_running = None
         self._last_backend_error_seen = None
         self._residue_cleanup_done = False
         self._node_pool_last_loaded_count = None
@@ -250,9 +260,7 @@ class MainWindow(QMainWindow):
         self._setup_tray_icon()
         self.activity_signal.connect(self._append_activity_log)
         set_activity_callback(lambda message, level: self.activity_signal.emit(message, level))
-        self.status_timer = QTimer(self)
-        self.status_timer.timeout.connect(self._poll_proxy_runtime_state)
-        self.status_timer.start(2000)
+        self._start_runtime_poller()
         QTimer.singleShot(0, self._check_group_ports_on_app_start)
         QTimer.singleShot(0, self._cleanup_stale_system_proxy_on_start)
         QTimer.singleShot(0, self._apply_startup_ui_settings)
@@ -375,6 +383,65 @@ class MainWindow(QMainWindow):
         self.gui_task_thread = None
         self.gui_task_worker = None
 
+
+    def _start_runtime_poller(self):
+        if self.runtime_poll_thread and self.runtime_poll_thread.isRunning():
+            return
+        self.runtime_poll_thread = QThread(self)
+        self.runtime_poll_worker = RuntimePollWorker(interval_seconds=2.0)
+        self.runtime_poll_worker.moveToThread(self.runtime_poll_thread)
+        self.runtime_poll_thread.started.connect(self.runtime_poll_worker.run)
+        self.runtime_poll_worker.snapshot_ready.connect(self._apply_runtime_snapshot)
+        self.runtime_poll_worker.finished.connect(self.runtime_poll_thread.quit)
+        self.runtime_poll_worker.finished.connect(self.runtime_poll_worker.deleteLater)
+        self.runtime_poll_thread.finished.connect(self.runtime_poll_thread.deleteLater)
+        self.runtime_poll_thread.finished.connect(self._cleanup_runtime_poller)
+        self.runtime_poll_thread.start()
+
+    def _stop_runtime_poller(self):
+        worker = self.runtime_poll_worker
+        thread = self.runtime_poll_thread
+        if worker:
+            worker.stop()
+        if thread and thread.isRunning():
+            thread.wait(1500)
+
+    def _cleanup_runtime_poller(self):
+        self.runtime_poll_worker = None
+        self.runtime_poll_thread = None
+
+    def _apply_runtime_snapshot(self, snapshot):
+        if not isinstance(snapshot, dict) or self.proxy_action_thread:
+            return
+        state = str(snapshot.get("state") or "stopped")
+        running = bool(snapshot.get("running"))
+        active_count = int(snapshot.get("active_connections") or 0)
+
+        if state == "starting":
+            self._set_proxy_starting_status()
+        elif state == "stopping":
+            self._set_proxy_stopping_status()
+        else:
+            self._set_proxy_status(running)
+        self._refresh_active_connection_count(active_count)
+
+        if running:
+            self._poll_core_route_events(snapshot.get("events"))
+            self._residue_cleanup_done = False
+            return
+
+        if state not in {"stopped", "failed"}:
+            return
+        error = snapshot.get("backend_error")
+        if error and error != self._last_backend_error_seen:
+            self._last_backend_error_seen = error
+            self.notify_error(f"后端服务已停止：{error}")
+        if not self._residue_cleanup_done:
+            self._log_lifecycle_event(f"runtime poll observed backend state={state}; cleanup allowed", "WARN")
+            self._disable_system_proxy_on_exit()
+            cleanup_proxy_residue()
+            self._residue_cleanup_done = True
+
     def _apply_startup_ui_settings(self):
         ui_settings = load_app_settings().get("ui", {})
 
@@ -397,12 +464,12 @@ class MainWindow(QMainWindow):
         root_layout.addWidget(self.pages, 1)
         self.setCentralWidget(root)
 
-        self._add_page("\u4eea\u8868\u76d8", self._dashboard_page())
-        self._add_page("\u8ba2\u9605\u7ba1\u7406", self._subscription_page())
-        self._add_page("\u8282\u70b9\u6c60", self._node_pool_page())
-        self._add_page("\u5206\u7ec4\u7ba1\u7406", self._group_page())
-        self._add_page("\u89c4\u5219\u7ba1\u7406", self._rules_page())
-        self._add_page("\u8bbe\u7f6e", self._settings_page())
+        self._add_page("仪表盘", self._dashboard_page())
+        self._add_lazy_page("订阅管理", self._subscription_page)
+        self._add_lazy_page("节点池", self._node_pool_page)
+        self._add_lazy_page("分组管理", self._group_page)
+        self._add_lazy_page("规则管理", self._rules_page)
+        self._add_lazy_page("设置", self._settings_page)
 
         self.nav.currentRowChanged.connect(self._on_navigation_changed)
         self.nav.setCurrentRow(0)
@@ -429,15 +496,34 @@ class MainWindow(QMainWindow):
         self.nav.addItem(QListWidgetItem(title))
         self.pages.addWidget(page)
 
+    def _add_lazy_page(self, title: str, builder):
+        row = self.pages.count()
+        self.nav.addItem(QListWidgetItem(title))
+        self.pages.addWidget(QWidget())
+        self._lazy_page_builders[row] = builder
+
+    def _ensure_page_built(self, row: int):
+        builder = self._lazy_page_builders.pop(row, None)
+        if builder is None:
+            return
+        old_page = self.pages.widget(row)
+        page = builder()
+        self.pages.removeWidget(old_page)
+        old_page.deleteLater()
+        self.pages.insertWidget(row, page)
+
     def _on_navigation_changed(self, row: int):
+        if row < 0:
+            return
+        self._ensure_page_built(row)
         self.pages.setCurrentIndex(row)
 
-        item = self.nav.item(row) if row >= 0 else None
-        if item and item.text() == "\u4eea\u8868\u76d8":
+        item = self.nav.item(row)
+        if item and item.text() == "仪表盘":
             self.refresh_dashboard()
-        if item and item.text() == "\u5206\u7ec4\u7ba1\u7406":
+        if item and item.text() == "分组管理":
             self.refresh_group_management_page()
-        if item and item.text() == "\u89c4\u5219\u7ba1\u7406":
+        if item and item.text() == "规则管理":
             self.refresh_rule_group_options()
 
     def _page_shell(self, title: str, hint: str):
@@ -471,7 +557,7 @@ class MainWindow(QMainWindow):
         grid.setHorizontalSpacing(16)
         grid.setVerticalSpacing(16)
 
-        stats = get_dashboard_stats()
+        stats = get_dashboard_stats(include_active_connections=False)
         proxy_host, proxy_port = self._context_proxy_endpoint()
         proxy_endpoint = f"{proxy_host}:{proxy_port}"
         cards = [
@@ -507,7 +593,8 @@ class MainWindow(QMainWindow):
 
         self.activity_log.setReadOnly(True)
         self.activity_log.setMinimumHeight(280)
-        self.activity_log.setText(
+        self.activity_log.document().setMaximumBlockCount(max(1, self._max_recent_activities))
+        self.activity_log.setPlainText(
             "\n".join(
                 [
                     "[INFO] GUI \u5df2\u542f\u52a8",
@@ -520,23 +607,17 @@ class MainWindow(QMainWindow):
         return page
 
     def _append_activity_log(self, message: str, level: str = "INFO"):
-        if self.activity_log:
-            timestamp = datetime.now().strftime("%H:%M:%S")
-            if message.startswith("["):
-                self.activity_log.append(f"{timestamp}  {message}")
-            else:
-                self.activity_log.append(f"{timestamp}  [{level}] {message}")
-            self._trim_activity_log()
+        if not self.activity_log:
+            return
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        if message.startswith("["):
+            line = f"{timestamp}  {message}"
+        else:
+            line = f"{timestamp}  [{level}] {message}"
+        self.activity_log.appendPlainText(line)
 
     def _trim_activity_log(self):
-        max_count = max(1, int(self._max_recent_activities or 200))
-
-        document = self.activity_log.document()
-        while document.blockCount() > max_count:
-            cursor = QTextCursor(document.firstBlock())
-            cursor.select(QTextCursor.SelectionType.BlockUnderCursor)
-            cursor.removeSelectedText()
-            cursor.deleteChar()
+        return
 
     def notify_success(self, message: str):
         self._append_activity_log(message, "INFO")
@@ -565,7 +646,7 @@ class MainWindow(QMainWindow):
             self._active_notifications.remove(toast)
 
     def refresh_dashboard(self):
-        stats = get_dashboard_stats()
+        stats = get_dashboard_stats(include_active_connections=False)
         state = get_proxy_state()
         if state == "starting":
             self._set_proxy_starting_status()
@@ -574,63 +655,34 @@ class MainWindow(QMainWindow):
         else:
             self._set_proxy_status(is_proxy_running())
         proxy_host, proxy_port = self._context_proxy_endpoint()
-        self._set_stat_value("\u672c\u5730\u4ee3\u7406", f"{proxy_host}:{proxy_port}")
-        self._set_stat_value("\u5206\u7ec4\u603b\u6570", str(stats["groups"]))
-        self._set_stat_value("\u8282\u70b9\u603b\u6570", str(stats["nodes"]))
-        self._set_stat_value("\u8ba2\u9605\u603b\u6570", str(stats["subscriptions"]))
-        self._set_stat_value("\u89c4\u5219\u603b\u6570", str(stats["rules"]))
-        self._refresh_active_connection_count()
+        self._set_stat_value("本地代理", f"{proxy_host}:{proxy_port}")
+        self._set_stat_value("分组总数", str(stats["groups"]))
+        self._set_stat_value("节点总数", str(stats["nodes"]))
+        self._set_stat_value("订阅总数", str(stats["subscriptions"]))
+        self._set_stat_value("规则总数", str(stats["rules"]))
+        self._refresh_active_connection_count(self._last_active_connection_count)
         self._append_auto_selector_status_logs()
 
-    def _refresh_active_connection_count(self):
-        active_count = count_active_connections() if is_proxy_running() else 0
-        self._set_stat_value("\u6d3b\u52a8\u8fde\u63a5", str(active_count))
+    def _refresh_active_connection_count(self, active_count: int | None = None):
+        if active_count is None:
+            active_count = self._last_active_connection_count
+        active_count = max(0, int(active_count or 0))
+        if active_count == self._last_active_connection_count:
+            value_label = self.dashboard_stat_labels.get("活动连接")
+            if value_label and value_label.text() == str(active_count):
+                return
+        self._last_active_connection_count = active_count
+        self._set_stat_value("活动连接", str(active_count))
 
     def _poll_proxy_runtime_state(self):
-        if self.proxy_action_thread:
+        return
+
+    def _poll_core_route_events(self, payload=None):
+        if not isinstance(payload, dict):
             return
-
-        state = get_proxy_state()
-        if state == "starting":
-            self._set_proxy_starting_status()
-            self._refresh_active_connection_count()
-            return
-
-        if state == "stopping":
-            self._set_proxy_stopping_status()
-            self._refresh_active_connection_count()
-            return
-
-        running = is_proxy_running()
-        self._set_proxy_status(running)
-        self._refresh_active_connection_count()
-
-        if running:
-            self._poll_core_route_events()
-            self._residue_cleanup_done = False
-            return
-
-        if state not in {"stopped", "failed"}:
-            return
-
-        error = get_backend_error()
-        if error and error != self._last_backend_error_seen:
-            self._last_backend_error_seen = error
-            self.notify_error(f"后端服务已停止：{error}")
-
-        if not self._residue_cleanup_done:
-            self._log_lifecycle_event(f"runtime poll observed backend state={state}; cleanup allowed", "WARN")
-            self._disable_system_proxy_on_exit()
-            cleanup_proxy_residue()
-            self._residue_cleanup_done = True
-
-    def _poll_core_route_events(self):
-        payload = get_core_events(self._last_core_event_id, limit=80)
         boot_id = payload.get("boot_id")
         if boot_id and boot_id != self._last_core_boot_id:
             self.reset_core_event_cursor(boot_id)
-            payload = get_core_events(None, limit=80)
-            boot_id = payload.get("boot_id") or boot_id
             self._last_core_boot_id = boot_id
 
         events = payload.get("events", [])
@@ -716,7 +768,7 @@ class MainWindow(QMainWindow):
 
     def _set_stat_value(self, label: str, value: str):
         value_label = self.dashboard_stat_labels.get(label)
-        if value_label:
+        if value_label and value_label.text() != value:
             value_label.setText(value)
 
     def _stat_card(self, label: str, value: str, subtext: str, color: str):
@@ -744,41 +796,48 @@ class MainWindow(QMainWindow):
         return card
 
     def _set_proxy_status(self, running: bool):
+        render_state = "running" if running else "stopped"
+        if self._last_rendered_proxy_state == render_state:
+            return
+        self._last_rendered_proxy_state = render_state
         if self.proxy_status_value_label:
-            text = "\u8fd0\u884c\u4e2d" if running else "\u5df2\u505c\u6b62"
+            text = "运行中" if running else "已停止"
             color = SUCCESS if running else MUTED
             self.proxy_status_value_label.setText(text)
             self.proxy_status_value_label.setStyleSheet(
                 f"font-size: 24px; font-weight: 800; color: {color};"
             )
-
         if self.proxy_status_sub_label:
-            self.proxy_status_sub_label.setText("\u540e\u7aef\u670d\u52a1\u5185\u7f6e\u8fd0\u884c\u4e2d" if running else "\u540e\u7aef\u670d\u52a1\u5df2\u505c\u6b62")
+            self.proxy_status_sub_label.setText("后端服务内置运行中" if running else "后端服务已停止")
         self._update_proxy_switch(running, enabled=True)
         self._update_group_edit_state()
-        self._update_tray_status()
+        self._update_tray_status(running)
 
     def _set_proxy_starting_status(self):
+        if self._last_rendered_proxy_state == "starting":
+            return
+        self._last_rendered_proxy_state = "starting"
         if self.proxy_status_value_label:
-            self.proxy_status_value_label.setText("\u542f\u52a8\u4e2d")
+            self.proxy_status_value_label.setText("启动中")
             self.proxy_status_value_label.setStyleSheet(
                 f"font-size: 24px; font-weight: 800; color: {PRIMARY};"
             )
-
         if self.proxy_status_sub_label:
-            self.proxy_status_sub_label.setText("\u540e\u7aef\u670d\u52a1\u542f\u52a8\u4e2d")
+            self.proxy_status_sub_label.setText("后端服务启动中")
         if self.proxy_switch:
             self.proxy_switch.setEnabled(False)
 
     def _set_proxy_stopping_status(self):
+        if self._last_rendered_proxy_state == "stopping":
+            return
+        self._last_rendered_proxy_state = "stopping"
         if self.proxy_status_value_label:
-            self.proxy_status_value_label.setText("\u505c\u6b62\u4e2d")
+            self.proxy_status_value_label.setText("停止中")
             self.proxy_status_value_label.setStyleSheet(
                 f"font-size: 24px; font-weight: 800; color: {PRIMARY};"
             )
-
         if self.proxy_status_sub_label:
-            self.proxy_status_sub_label.setText("\u540e\u7aef\u670d\u52a1\u505c\u6b62\u4e2d")
+            self.proxy_status_sub_label.setText("后端服务停止中")
         if self.proxy_switch:
             self.proxy_switch.setEnabled(False)
 
@@ -861,6 +920,7 @@ class MainWindow(QMainWindow):
             return
 
         if not ok:
+            self._exit_after_proxy_stop = False
             self.refresh_dashboard()
             self._update_tray_status()
             self._update_proxy_switch(True, enabled=True)
@@ -870,6 +930,9 @@ class MainWindow(QMainWindow):
         self._set_proxy_status(False)
         self.reset_core_event_cursor()
         self.finish_busy(True, "代理已停止")
+        if self._exit_after_proxy_stop:
+            self._exit_after_proxy_stop = False
+            self._finalize_application_exit()
 
     def _cleanup_proxy_action_thread(self):
         self.proxy_action_thread = None
@@ -1013,8 +1076,12 @@ class MainWindow(QMainWindow):
         if not QSystemTrayIcon.isSystemTrayAvailable():
             self._append_activity_log("[WARN] 系统托盘不可用，关闭窗口时将只能最小化")
             return
-
-        self.tray_icon = QSystemTrayIcon(self._make_tray_icon(is_proxy_running()), self)
+        self._tray_icons = {
+            True: self._make_tray_icon(True),
+            False: self._make_tray_icon(False),
+        }
+        running = is_proxy_running()
+        self.tray_icon = QSystemTrayIcon(self._tray_icons[running], self)
         self.tray_icon.setToolTip("ContextProxy")
 
         self.tray_menu = QMenu(self)
@@ -1038,16 +1105,21 @@ class MainWindow(QMainWindow):
         self.tray_icon.setContextMenu(self.tray_menu)
         self.tray_icon.activated.connect(self._on_tray_icon_activated)
         self.tray_icon.show()
-        self._update_tray_status()
+        self._update_tray_status(running, force=True)
 
-    def _update_tray_status(self):
+    def _update_tray_status(self, running: bool | None = None, force: bool = False):
         if not self.tray_icon:
             return
-
-        running = is_proxy_running()
-        self.tray_icon.setIcon(self._make_tray_icon(running))
+        running = is_proxy_running() if running is None else bool(running)
+        if not force and self._last_tray_running == running:
+            return
+        self._last_tray_running = running
+        icon = self._tray_icons.get(running)
+        if icon is None:
+            icon = self._make_tray_icon(running)
+            self._tray_icons[running] = icon
+        self.tray_icon.setIcon(icon)
         self.tray_icon.setToolTip("ContextProxy - " + ("运行中" if running else "已停止"))
-
         if self.tray_start_action:
             self.tray_start_action.setEnabled(not running)
         if self.tray_stop_action:
@@ -1079,10 +1151,8 @@ class MainWindow(QMainWindow):
         if self.busy:
             self.notify_info("任务处理中，请稍候")
             return
-
         self._log_lifecycle_event("tray exit requested")
         self._force_real_close = True
-
         if is_proxy_running():
             result = QMessageBox.question(
                 self,
@@ -1095,19 +1165,30 @@ class MainWindow(QMainWindow):
                 self._force_real_close = False
                 return
             if result == QMessageBox.Yes:
-                self._disable_system_proxy_on_exit()
-                self._log_lifecycle_event("stop_proxy_process called, reason=tray_exit")
-                ok, error = stop_proxy_process()
-                if not ok:
-                    self.notify_error(error or "代理停止失败")
-                    self._force_real_close = False
-                    return
-        else:
-            self._disable_system_proxy_on_exit()
+                self._begin_async_exit()
+                return
+            self._force_real_close = False
+            return
+        self._finalize_application_exit()
 
+    def _begin_async_exit(self):
+        if self.proxy_action_thread:
+            return
+        self._exit_after_proxy_stop = True
+        self.start_busy("正在停止代理并退出...", "退出")
+        if self.proxy_switch:
+            self.proxy_switch.setEnabled(False)
+        self._run_proxy_action("stop")
+
+    def _finalize_application_exit(self):
+        if self._finalizing_exit:
+            return
+        self._finalizing_exit = True
+        self._force_real_close = True
+        self._stop_runtime_poller()
+        self._disable_system_proxy_on_exit()
         if self.tray_icon:
             self.tray_icon.hide()
-
         app = QApplication.instance()
         if app:
             app.quit()
@@ -1172,29 +1253,33 @@ class MainWindow(QMainWindow):
     def _refresh_subscription_table(self):
         if not self.subscription_table:
             return
-
         rows = list_subscriptions()
         self.subscription_urls = {row["name"]: row.get("url", "") for row in rows}
-        self.subscription_table.setRowCount(len(rows))
-
-        for row_index, row in enumerate(rows):
-            values = [
-                row["name"],
-                str(row["node_count"]),
-                row["yaml_file"],
-                row["json_file"],
-                row["updated_at"],
-                row["status"],
-            ]
-
-            self.subscription_table.setRowHeight(row_index, 34)
-            for column_index, value in enumerate(values):
-                item = QTableWidgetItem(value)
-                if column_index in {1, 5}:
-                    item.setTextAlignment(Qt.AlignCenter)
-                if column_index == 5:
-                    item.setForeground(QColor(SUCCESS))
-                self.subscription_table.setItem(row_index, column_index, item)
+        table = self.subscription_table
+        previous_updates = table.updatesEnabled()
+        table.setUpdatesEnabled(False)
+        table.blockSignals(True)
+        try:
+            table.setRowCount(len(rows))
+            for row_index, row in enumerate(rows):
+                values = [
+                    row["name"],
+                    str(row["node_count"]),
+                    row["yaml_file"],
+                    row["json_file"],
+                    row["updated_at"],
+                    row["status"],
+                ]
+                for column_index, value in enumerate(values):
+                    item = QTableWidgetItem(value)
+                    if column_index in {1, 5}:
+                        item.setTextAlignment(Qt.AlignCenter)
+                    if column_index == 5:
+                        item.setForeground(QColor(SUCCESS))
+                    table.setItem(row_index, column_index, item)
+        finally:
+            table.blockSignals(False)
+            table.setUpdatesEnabled(previous_updates)
 
     def _sync_selected_subscription_to_editor(self):
         if not self.subscription_table or not self.subscription_name_input:
@@ -1573,19 +1658,14 @@ class MainWindow(QMainWindow):
         ):
             if button:
                 button.setEnabled(not readonly)
-
-        # “重新自动选择”只是对正在运行的 mihomo 切换当前分组节点，
-        # 不会修改 group_nodes.yaml / 端口 / 分组配置，所以代理运行中应保持可用。
         if self.group_reselect_button:
             self.group_reselect_button.setEnabled(bool(self.current_group_name) and readonly)
-
         if self.group_readonly_hint:
             if readonly:
                 self.group_readonly_hint.setText(
                     "代理运行中，分组配置暂不可修改；可以使用“重新自动选择”切换当前分组节点。"
                 )
             self.group_readonly_hint.setVisible(readonly)
-
         if self.group_name_input:
             self.group_name_input.setReadOnly(True)
         if self.group_port_input:
@@ -1594,12 +1674,17 @@ class MainWindow(QMainWindow):
             self.group_controller_input.setReadOnly(readonly)
         if self.strategy_combo:
             self.strategy_combo.setEnabled(not readonly)
-
         if self.group_node_table:
             for row_index in range(self.group_node_table.rowCount()):
-                checkbox = self.group_node_table.cellWidget(row_index, 0)
-                if isinstance(checkbox, QCheckBox):
-                    checkbox.setEnabled(not readonly)
+                item = self.group_node_table.item(row_index, 0)
+                if not item:
+                    continue
+                flags = item.flags()
+                if readonly:
+                    flags &= ~Qt.ItemIsEnabled
+                else:
+                    flags |= Qt.ItemIsEnabled
+                item.setFlags(flags)
 
     def _used_group_ports(self, excluded_group: str | None = None) -> set[int]:
         used_ports = self._reserved_system_ports()
@@ -1886,46 +1971,50 @@ class MainWindow(QMainWindow):
     def _populate_group_node_table(self, selected_nodes: set[str]):
         if not self.group_node_table:
             return
-
         table = self.group_node_table
-        table.setRowCount(len(self.node_pool_nodes))
-
-        for row_index, (fallback_name, node) in enumerate(self.node_pool_nodes.items()):
-            node = node if isinstance(node, dict) else {}
-            node_name = str(node.get("name") or fallback_name)
-            checkbox = QCheckBox()
-            checkbox.setChecked(node_name in selected_nodes)
-            checkbox.setEnabled(not is_proxy_running())
-            table.setCellWidget(row_index, 0, checkbox)
-            table.setRowHeight(row_index, 34)
-
-            row = (
-                str(node.get("type") or ""),
-                node_name,
-                str(node.get("server") or ""),
-                self._latency_text_for_node(node_name),
-                extract_subscription_source(node_name),
-            )
-
-            for column_index, value in enumerate(row, start=1):
-                item = QTableWidgetItem(value)
-                if column_index == 4:
-                    item.setTextAlignment(Qt.AlignCenter)
-                table.setItem(row_index, column_index, item)
+        previous_updates = table.updatesEnabled()
+        table.setUpdatesEnabled(False)
+        table.blockSignals(True)
+        try:
+            table.setRowCount(len(self.node_pool_nodes))
+            readonly = is_proxy_running()
+            for row_index, (fallback_name, node) in enumerate(self.node_pool_nodes.items()):
+                node = node if isinstance(node, dict) else {}
+                node_name = str(node.get("name") or fallback_name)
+                check_item = QTableWidgetItem()
+                flags = check_item.flags() | Qt.ItemIsUserCheckable
+                flags &= ~Qt.ItemIsEditable
+                if readonly:
+                    flags &= ~Qt.ItemIsEnabled
+                check_item.setFlags(flags)
+                check_item.setCheckState(Qt.Checked if node_name in selected_nodes else Qt.Unchecked)
+                check_item.setTextAlignment(Qt.AlignCenter)
+                table.setItem(row_index, 0, check_item)
+                row = (
+                    str(node.get("type") or ""),
+                    node_name,
+                    str(node.get("server") or ""),
+                    self._latency_text_for_node(node_name),
+                    extract_subscription_source(node_name),
+                )
+                for column_index, value in enumerate(row, start=1):
+                    item = QTableWidgetItem(value)
+                    if column_index == 4:
+                        item.setTextAlignment(Qt.AlignCenter)
+                    table.setItem(row_index, column_index, item)
+        finally:
+            table.blockSignals(False)
+            table.setUpdatesEnabled(previous_updates)
 
     def _checked_group_nodes(self) -> list[str]:
         checked = []
-
         if not self.group_node_table:
             return checked
-
         for row_index in range(self.group_node_table.rowCount()):
-            checkbox = self.group_node_table.cellWidget(row_index, 0)
+            check_item = self.group_node_table.item(row_index, 0)
             node_item = self.group_node_table.item(row_index, 2)
-
-            if isinstance(checkbox, QCheckBox) and checkbox.isChecked() and node_item:
+            if check_item and check_item.checkState() == Qt.Checked and node_item:
                 checked.append(node_item.text())
-
         return checked
 
     def _validate_current_group_ports(self) -> tuple[bool, str | None, int | None, int | None, list[str]]:
@@ -2814,44 +2903,42 @@ class MainWindow(QMainWindow):
         table.verticalHeader().setVisible(False)
         table.verticalHeader().setDefaultSectionSize(34)
         table.setShowGrid(True)
-        table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        table.setSortingEnabled(False)
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
 
     def _fill_table(self, table: QTableWidget, rows: list[tuple[str, ...]]):
-        table.setRowCount(len(rows))
-        for row_index, row in enumerate(rows):
-            table.setRowHeight(row_index, 34)
-            for column_index, value in enumerate(row):
-                item = QTableWidgetItem(value)
-
-                if value in {"\u6d3b\u52a8", "\u53ef\u7528"}:
-                    item.setForeground(QColor(SUCCESS if value == "\u6d3b\u52a8" else PRIMARY))
-                    item.setTextAlignment(Qt.AlignCenter)
-
-                if value == "\u672a\u6d4b":
-                    item.setForeground(QColor(MUTED))
-                    item.setTextAlignment(Qt.AlignCenter)
-
-                if value == "\u5931\u8d25":
-                    item.setForeground(QColor(DANGER))
-                    item.setTextAlignment(Qt.AlignCenter)
-
-                if value == "\u2713":
-                    item.setForeground(QColor(SUCCESS))
-                    item.setTextAlignment(Qt.AlignCenter)
-
-                if value == "\u00d7":
-                    item.setForeground(QColor(DANGER))
-                    item.setTextAlignment(Qt.AlignCenter)
-
-                if value in {"\u662f", "\u5426"}:
-                    item.setTextAlignment(Qt.AlignCenter)
-
-                if column_index == table.columnCount() - 1 and value.isdigit():
-                    item.setForeground(QColor(SUCCESS if int(value) < 150 else DANGER))
-                    item.setTextAlignment(Qt.AlignCenter)
-
-                table.setItem(row_index, column_index, item)
-
+        previous_updates = table.updatesEnabled()
+        table.setUpdatesEnabled(False)
+        table.blockSignals(True)
+        try:
+            table.setRowCount(len(rows))
+            for row_index, row in enumerate(rows):
+                for column_index, value in enumerate(row):
+                    item = QTableWidgetItem(value)
+                    if value in {"活动", "可用"}:
+                        item.setForeground(QColor(SUCCESS if value == "活动" else PRIMARY))
+                        item.setTextAlignment(Qt.AlignCenter)
+                    if value == "未测":
+                        item.setForeground(QColor(MUTED))
+                        item.setTextAlignment(Qt.AlignCenter)
+                    if value == "失败":
+                        item.setForeground(QColor(DANGER))
+                        item.setTextAlignment(Qt.AlignCenter)
+                    if value == "✓":
+                        item.setForeground(QColor(SUCCESS))
+                        item.setTextAlignment(Qt.AlignCenter)
+                    if value == "×":
+                        item.setForeground(QColor(DANGER))
+                        item.setTextAlignment(Qt.AlignCenter)
+                    if value in {"是", "否"}:
+                        item.setTextAlignment(Qt.AlignCenter)
+                    if column_index == table.columnCount() - 1 and value.isdigit():
+                        item.setForeground(QColor(SUCCESS if int(value) < 150 else DANGER))
+                        item.setTextAlignment(Qt.AlignCenter)
+                    table.setItem(row_index, column_index, item)
+        finally:
+            table.blockSignals(False)
+            table.setUpdatesEnabled(previous_updates)
 
     def _start_node_delay_test(self):
         if self.busy:
@@ -2882,6 +2969,43 @@ class MainWindow(QMainWindow):
         self.delay_test_thread.finished.connect(self.delay_test_thread.deleteLater)
         self.delay_test_thread.start()
 
+    def _apply_latency_results_to_tables(self):
+        if self.node_pool_table:
+            table = self.node_pool_table
+            table.setUpdatesEnabled(False)
+            try:
+                for row in range(table.rowCount()):
+                    name_item = table.item(row, 3)
+                    if not name_item:
+                        continue
+                    node_name = name_item.text()
+                    status = self._latency_status_for_node(node_name)
+                    latency = self._latency_text_for_node(node_name)
+                    status_item = table.item(row, 1) or QTableWidgetItem()
+                    latency_item = table.item(row, 8) or QTableWidgetItem()
+                    status_item.setText(status)
+                    latency_item.setText(latency)
+                    status_item.setTextAlignment(Qt.AlignCenter)
+                    latency_item.setTextAlignment(Qt.AlignCenter)
+                    table.setItem(row, 1, status_item)
+                    table.setItem(row, 8, latency_item)
+            finally:
+                table.setUpdatesEnabled(True)
+        if self.group_node_table:
+            table = self.group_node_table
+            table.setUpdatesEnabled(False)
+            try:
+                for row in range(table.rowCount()):
+                    name_item = table.item(row, 2)
+                    if not name_item:
+                        continue
+                    latency_item = table.item(row, 4) or QTableWidgetItem()
+                    latency_item.setText(self._latency_text_for_node(name_item.text()))
+                    latency_item.setTextAlignment(Qt.AlignCenter)
+                    table.setItem(row, 4, latency_item)
+            finally:
+                table.setUpdatesEnabled(True)
+
     def _finish_node_delay_test(self, result: dict):
         if self.node_delay_test_button:
             self.node_delay_test_button.setEnabled(True)
@@ -2902,9 +3026,7 @@ class MainWindow(QMainWindow):
         )
         total_count = len(self.node_latency_cache)
 
-        self._refresh_node_pool_table()
-        if self.current_group_name:
-            self._populate_group_node_table(set(self._current_group_nodes(self.current_group_name)))
+        self._apply_latency_results_to_tables()
 
         if result.get("cancelled"):
             self.finish_busy(True)
@@ -2917,63 +3039,42 @@ class MainWindow(QMainWindow):
         self.delay_test_worker = None
 
     def closeEvent(self, event):
+        if self._finalizing_exit:
+            event.accept()
+            return
         if self.busy:
             event.ignore()
             self.notify_info("任务处理中，请稍候")
             return
-
-        if self._force_real_close:
-            self._disable_system_proxy_on_exit()
-            if is_proxy_running() or get_proxy_state() in {"starting", "stopping", "failed"}:
-                try:
-                    self._log_lifecycle_event("stop_proxy_process called, reason=real_close_event")
-                    stop_proxy_process()
-                except Exception as exc:
-                    self._append_activity_log(f"[WARN] 退出时停止后端失败：{exc}")
-            else:
-                cleanup_proxy_residue()
-            if self.tray_icon:
-                self.tray_icon.hide()
-            event.accept()
-            return
-
-        if load_app_settings().get("ui", {}).get("close_to_tray", True):
+        if not self._force_real_close and load_app_settings().get("ui", {}).get("close_to_tray", True):
             event.ignore()
             self.hide()
             self._update_tray_status()
             self._log_lifecycle_event("window close ignored, hidden to tray; backend/service/proxy unchanged")
             self._append_activity_log("[INFO] 窗口已最小化到系统托盘")
             return
-
-        if not is_proxy_running():
-            self._disable_system_proxy_on_exit()
-            if self.tray_icon:
-                self.tray_icon.hide()
-            event.accept()
-            return
-
-        result = QMessageBox.question(
-            self,
-            "ContextProxy",
-            "代理正在运行，是否停止代理并退出？",
-            QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel,
-            QMessageBox.Yes,
-        )
-
-        if result == QMessageBox.Cancel:
-            event.ignore()
-            return
-
-        if result == QMessageBox.Yes:
-            self._disable_system_proxy_on_exit()
-
-            self._log_lifecycle_event("stop_proxy_process called, reason=close_event_exit_confirmed")
-            ok, error = stop_proxy_process()
-            if not ok:
-                self.notify_error(error or "代理停止失败")
+        if is_proxy_running() or get_proxy_state() in {"starting", "stopping"}:
+            result = QMessageBox.question(
+                self,
+                "ContextProxy",
+                "代理正在运行，是否停止代理并退出？",
+                QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel,
+                QMessageBox.Yes,
+            )
+            if result == QMessageBox.Cancel:
                 event.ignore()
+                self._force_real_close = False
                 return
-
+            if result == QMessageBox.Yes:
+                event.ignore()
+                self._begin_async_exit()
+                return
+            event.ignore()
+            self._force_real_close = False
+            return
+        self._stop_runtime_poller()
+        self._disable_system_proxy_on_exit()
         if self.tray_icon:
             self.tray_icon.hide()
         event.accept()
+

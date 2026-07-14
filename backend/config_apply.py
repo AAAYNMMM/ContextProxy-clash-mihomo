@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Iterable
 
 from backend.activity_bus import write_log
-from backend.app_settings import get_default_app_settings
+from backend.app_settings import clear_app_settings_cache, get_default_app_settings
 from backend.atomic_writer import atomic_write_text, atomic_write_yaml
 from backend.paths import APP_PROCESSES_FILE, CONFIG_DIR, GROUPS_DOMAINS_FILE
 
@@ -102,6 +102,7 @@ def save_app_settings_file_internal(settings: dict) -> tuple[bool, str | None]:
         return False, error
     try:
         atomic_write_yaml(APP_SETTINGS_FILE, data)
+        clear_app_settings_cache()
     except Exception as exc:
         return False, str(exc)
     return True, None
@@ -296,6 +297,7 @@ def save_app_settings_and_apply(settings: dict, previous_settings: dict | None =
         return ApplyResult(core_payload=payload)
     except Exception:
         _restore_file(APP_SETTINGS_FILE, snapshot)
+        clear_app_settings_cache()
         _regenerate_core_config_best_effort()
         _regenerate_mihomo_config_best_effort()
         raise

@@ -1,12 +1,19 @@
 from pathlib import Path
+import threading
+import time
 
 from backend.paths import APP_PROCESSES_FILE, CONFIG_DIR, GROUPS_DOMAINS_FILE
+from backend.runtime_snapshot import get_core_metrics
 
 GROUP_NODES_FILE = CONFIG_DIR / "group_nodes.yaml"
 NODE_POOL_FILE = CONFIG_DIR / "node_pool.yaml"
 SUBSCRIPTIONS_DIR = CONFIG_DIR / "subscriptions"
 DOMAIN_RULES_FILE = GROUPS_DOMAINS_FILE
 PROCESS_RULES_FILE = APP_PROCESSES_FILE
+
+_static_stats_lock = threading.RLock()
+_static_stats_cache: dict[str, int] | None = None
+_static_stats_cached_at = 0.0
 
 
 def _load_yaml(path: Path) -> dict:
@@ -71,6 +78,13 @@ def count_rules() -> int:
 
 
 def count_active_connections() -> int:
+    cached_metrics = get_core_metrics(max_age=8.0)
+    if isinstance(cached_metrics, dict):
+        try:
+            return int(cached_metrics.get("active") or 0)
+        except (TypeError, ValueError):
+            pass
+
     try:
         from backend.core_config import get_core_listen_settings
         from backend.core_launcher import is_core_running
@@ -81,12 +95,15 @@ def count_active_connections() -> int:
             response = local_get(f"http://{api_host}:{api_port}/metrics", timeout=0.3)
             if response.status_code == 200:
                 data = response.json()
+                if isinstance(data, dict):
+                    from backend.runtime_snapshot import update_core_metrics
+
+                    update_core_metrics(data)
                 return int(data.get("active") or 0)
     except Exception:
         pass
 
     return 0
-
 
 def get_core_events(after_id: int | None = 0, limit: int = 100) -> dict:
     try:
@@ -115,11 +132,19 @@ def get_core_events(after_id: int | None = 0, limit: int = 100) -> dict:
         return {"boot_id": None, "events": []}
 
 
-def get_dashboard_stats() -> dict[str, int]:
-    return {
-        "groups": count_groups(),
-        "nodes": count_nodes(),
-        "subscriptions": count_subscriptions(),
-        "rules": count_rules(),
-        "active_connections": count_active_connections(),
-    }
+def get_dashboard_stats(include_active_connections: bool = True) -> dict[str, int]:
+    global _static_stats_cache, _static_stats_cached_at
+    now = time.monotonic()
+    with _static_stats_lock:
+        if _static_stats_cache is None or now - _static_stats_cached_at > 1.0:
+            _static_stats_cache = {
+                "groups": count_groups(),
+                "nodes": count_nodes(),
+                "subscriptions": count_subscriptions(),
+                "rules": count_rules(),
+            }
+            _static_stats_cached_at = now
+        result = dict(_static_stats_cache)
+    result["active_connections"] = count_active_connections() if include_active_connections else 0
+    return result
+
