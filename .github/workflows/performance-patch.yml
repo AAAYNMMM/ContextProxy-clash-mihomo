@@ -1,3 +1,4 @@
+# Temporary branch-local trigger; removed by the validation driver.
 name: Apply performance smoothness patch
 
 on:
