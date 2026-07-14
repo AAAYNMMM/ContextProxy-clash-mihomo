@@ -1,4 +1,4 @@
-name: Validate and apply performance patch
+name: Review and verify performance smoothness
 
 on:
   pull_request:
@@ -11,7 +11,7 @@ permissions:
   pull-requests: read
 
 jobs:
-  patch-test-commit:
+  review-test-commit:
     if: github.actor != 'github-actions[bot]'
     runs-on: windows-latest
     steps:
@@ -28,126 +28,158 @@ jobs:
         with:
           go-version: '1.22.x'
 
-      - name: Apply patch
-        id: apply_patch
-        continue-on-error: true
+      - name: Apply final review fixes
         shell: pwsh
         run: |
           @'
-          import base64
-          import re
-          import zlib
           from pathlib import Path
 
-          path = Path("tools/apply_performance_patch.py")
-          wrapper = path.read_text(encoding="utf-8")
-          match = re.search(r"_PAYLOAD = r'''(.*?)'''", wrapper, re.S)
-          if not match:
-              raise RuntimeError("performance payload not found")
-          source = zlib.decompress(base64.b85decode(match.group(1).encode("ascii"))).decode("utf-8")
-          old = r'category = (category or "backend").strip().lower().replace("/", "_").replace("\\", "_")'
-          new = r'category = (category or "backend").strip().lower().replace("/", "_").replace("\\\\", "_")'
-          if source.count(old) != 1:
-              raise RuntimeError(f"activity bus escape repair expected one match, found {source.count(old)}")
-          source = source.replace(old, new, 1)
-          payload = base64.b85encode(zlib.compress(source.encode("utf-8"), 9)).decode("ascii")
-          repaired = "import base64\nimport zlib\n\n_PAYLOAD = r'''" + payload + "'''\n\nexec(compile(zlib.decompress(base64.b85decode(_PAYLOAD.encode(\"ascii\"))), __file__, \"exec\"))\n"
-          path.write_text(repaired, encoding="utf-8", newline="\n")
-          '@ | Set-Content "$env:RUNNER_TEMP\repair-performance-patch.py" -Encoding utf8
-          python "$env:RUNNER_TEMP\repair-performance-patch.py" *>&1 | Tee-Object "$env:RUNNER_TEMP\01-patch.txt"
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          python tools/apply_performance_patch.py *>&1 | Tee-Object -Append "$env:RUNNER_TEMP\01-patch.txt"
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          def replace_once(path: Path, old: str, new: str) -> None:
+              text = path.read_text(encoding="utf-8")
+              if new in text:
+                  return
+              count = text.count(old)
+              if count != 1:
+                  raise RuntimeError(f"{path}: expected one match, found {count}")
+              path.write_text(text.replace(old, new, 1), encoding="utf-8", newline="\n")
+
+          main = Path("gui/main_window.py")
+          replace_once(
+              main,
+              "from gui.dashboard_store import count_active_connections, get_core_events, get_dashboard_stats",
+              "from gui.dashboard_store import get_dashboard_stats",
+          )
+          replace_once(main, "    get_backend_error,\n", "")
+
+          replace_once(
+              main,
+              '''        if self.node_pool_table:
+              table = self.node_pool_table
+              table.setUpdatesEnabled(False)
+              try:
+          ''',
+              '''        if self.node_pool_table:
+              table = self.node_pool_table
+              previous_updates = table.updatesEnabled()
+              table.setUpdatesEnabled(False)
+              try:
+          ''',
+          )
+          replace_once(
+              main,
+              '''            finally:
+                  table.setUpdatesEnabled(True)
+              if self.group_node_table:
+                  table = self.group_node_table
+                  table.setUpdatesEnabled(False)
+                  try:
+          ''',
+              '''            finally:
+                  table.setUpdatesEnabled(previous_updates)
+              if self.group_node_table:
+                  table = self.group_node_table
+                  previous_updates = table.updatesEnabled()
+                  table.setUpdatesEnabled(False)
+                  try:
+          ''',
+          )
+          replace_once(
+              main,
+              '''            finally:
+                  table.setUpdatesEnabled(True)
+
+              def _finish_node_delay_test(self, result: dict):
+          ''',
+              '''            finally:
+                  table.setUpdatesEnabled(previous_updates)
+
+              def _finish_node_delay_test(self, result: dict):
+          ''',
+          )
+
+          core = Path("core/main.go")
+          replace_once(
+              core,
+              '''\twriter := newTimedConnWriter(dst, settings.writeTimeout)
+          \tpendingBytes := int64(0)
+          \tlastStatsFlush := time.Now()
+          \tflushStats := func(force bool) {
+          \t\tif pendingBytes == 0 {
+          \t\t\treturn
+          \t\t}
+          \t\tnow := time.Now()
+          ''',
+              '''\twriter := newTimedConnWriter(dst, settings.writeTimeout)
+          \tconnInfo := c.getConn(id)
+          \tpendingBytes := int64(0)
+          \tlastStatsFlush := time.Now()
+          \tflushStats := func(force bool, now time.Time) {
+          \t\tif pendingBytes == 0 {
+          \t\t\treturn
+          \t\t}
+          ''',
+          )
+          replace_once(core, "\t\tflushStats(true)\n", "\t\tflushStats(true, time.Now())\n")
+          replace_once(
+              core,
+              '''\t\t\tpendingBytes += int64(n)
+          \t\t\tflushStats(false)
+          \t\t\twindowBytes += int64(n)
+          \t\t\tnow := time.Now()
+          ''',
+              '''\t\t\tpendingBytes += int64(n)
+          \t\t\twindowBytes += int64(n)
+          \t\t\tnow := time.Now()
+          \t\t\tif connInfo.ID != 0 {
+          \t\t\t\tconnInfo.LastActiveAt.Store(now.UnixNano())
+          \t\t\t}
+          \t\t\tflushStats(false, now)
+          ''',
+          )
+          '@ | Set-Content "$env:RUNNER_TEMP\final-review-fixes.py" -Encoding utf8
+          python "$env:RUNNER_TEMP\final-review-fixes.py"
 
       - name: Format Go
-        id: format_go
-        if: steps.apply_patch.outcome == 'success'
-        continue-on-error: true
         shell: pwsh
-        run: |
-          gofmt -w core/main.go *>&1 | Tee-Object "$env:RUNNER_TEMP\02-gofmt.txt"
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        run: gofmt -w core/main.go
 
       - name: Install Python test dependencies
-        id: install_deps
-        if: steps.apply_patch.outcome == 'success' && steps.format_go.outcome == 'success'
-        continue-on-error: true
         shell: pwsh
         run: |
-          python -m pip install --upgrade pip *>&1 | Tee-Object "$env:RUNNER_TEMP\03-deps.txt"
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          python -m pip install pytest PyYAML requests psutil PySide6 *>&1 | Tee-Object -Append "$env:RUNNER_TEMP\03-deps.txt"
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -m pip install --upgrade pip
+          python -m pip install pytest PyYAML requests psutil PySide6
 
       - name: Python syntax check
-        id: python_syntax
-        if: steps.install_deps.outcome == 'success'
-        continue-on-error: true
         shell: pwsh
-        run: |
-          python -m compileall -q backend gui *>&1 | Tee-Object "$env:RUNNER_TEMP\04-python-syntax.txt"
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        env:
+          PYTHONPYCACHEPREFIX: ${{ runner.temp }}\contextproxy-pycache
+        run: python -m compileall -q backend gui
 
       - name: Python tests
-        id: python_tests
-        if: steps.python_syntax.outcome == 'success'
-        continue-on-error: true
         shell: pwsh
+        env:
+          PYTHONPYCACHEPREFIX: ${{ runner.temp }}\contextproxy-pycache
         run: |
           if (Test-Path tests) {
-            python -m pytest -q *>&1 | Tee-Object "$env:RUNNER_TEMP\05-pytest.txt"
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            python -m pytest -q
           } else {
-            "No Python tests directory; syntax check completed." | Tee-Object "$env:RUNNER_TEMP\05-pytest.txt"
+            Write-Host "No Python tests directory; syntax check completed."
           }
 
       - name: Go tests
-        id: go_tests
-        if: steps.python_tests.outcome == 'success'
-        continue-on-error: true
         shell: pwsh
         working-directory: core
-        run: |
-          go test ./... *>&1 | Tee-Object "$env:RUNNER_TEMP\06-go-test.txt"
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        run: go test ./...
 
-      - name: Publish validation failure
-        if: always() && (steps.apply_patch.outcome == 'failure' || steps.format_go.outcome == 'failure' || steps.install_deps.outcome == 'failure' || steps.python_syntax.outcome == 'failure' || steps.python_tests.outcome == 'failure' || steps.go_tests.outcome == 'failure')
+      - name: Commit reviewed implementation
         shell: pwsh
         run: |
-          $report = Join-Path $env:RUNNER_TEMP "performance-validation-error.txt"
-          "Performance validation failed." | Set-Content $report
-          Get-ChildItem "$env:RUNNER_TEMP\0*.txt" -ErrorAction SilentlyContinue | Sort-Object Name | ForEach-Object {
-            Add-Content $report "`n===== $($_.Name) ====="
-            Get-Content $_.FullName -Tail 120 | Add-Content $report
+          if (-not (git status --porcelain)) {
+            Write-Host "No review fixes to commit."
+            exit 0
           }
-          git reset --hard HEAD
-          Copy-Item $report performance-patch-error.txt
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add performance-patch-error.txt
-          git commit -m "ci: record performance validation failure"
-          git push origin HEAD:${{ github.event.pull_request.head.ref }}
-          exit 1
-
-      - name: Remove temporary patch machinery
-        if: steps.go_tests.outcome == 'success'
-        shell: pwsh
-        run: |
-          Remove-Item tools/apply_performance_patch.py
-          Remove-Item .github/workflows/performance-patch.yml
-          Remove-Item performance-patch-error.txt -ErrorAction SilentlyContinue
-          if ((Test-Path tools) -and -not (Get-ChildItem tools -Force)) {
-            Remove-Item tools
-          }
-
-      - name: Commit optimized implementation
-        if: steps.go_tests.outcome == 'success'
-        shell: pwsh
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -A
-          git status --short
-          git commit -m "perf: smooth GUI polling and proxy hot paths"
+          git add gui/main_window.py core/main.go
+          git commit -m "perf: preserve activity accuracy and UI state"
           git push origin HEAD:${{ github.event.pull_request.head.ref }}
