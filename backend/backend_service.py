@@ -38,7 +38,7 @@ class BackendService:
         self._loop_ready_event = threading.Event()
         self._state_lock = threading.RLock()
         self.core_mode = False
-        self._last_core_traffic_trigger: dict[str, tuple[int, int, int, int]] = {}
+        self._last_core_traffic_trigger: dict[str, tuple[int, int, int, int, str]] = {}
 
     def start(self) -> tuple[bool, str | None]:
         with self._state_lock:
@@ -303,7 +303,7 @@ class BackendService:
         self._set_state("stopping")
         await self._cleanup_services()
         self.core_mode = False
-        self._last_core_traffic_trigger: dict[str, tuple[int, int, int, int]] = {}
+        self._last_core_traffic_trigger: dict[str, tuple[int, int, int, int, str]] = {}
         self._set_state(final_state)
         self.stopped_event.set()
 
@@ -476,7 +476,7 @@ class BackendService:
                 raise RuntimeError("contextproxy core /health unavailable")
 
     async def _watch_core_metrics(self):
-        from backend.group_health import schedule_group_recovery
+        from backend.group_health import schedule_group_recovery, should_recover_from_core_metrics
 
         while True:
             await asyncio.sleep(2)
@@ -509,19 +509,21 @@ class BackendService:
                     recent_fail = int(stats.get("recent_fail_count") or 0)
                     consecutive = int(stats.get("consecutive_failures") or 0)
                     updated_at = int(stats.get("updated_at") or 0)
+                    last_reason = str(stats.get("last_reason") or "")
                     fail_rate = recent_fail / max(1, recent_total)
-                    should_recover = (
-                        recent_total >= 20
-                        and recent_fail >= 8
-                        and fail_rate >= 0.40
-                    ) or consecutive >= 5
+                    should_recover, immediate_node_failure = should_recover_from_core_metrics(
+                        recent_total,
+                        recent_fail,
+                        consecutive,
+                        last_reason,
+                    )
 
                     if not should_recover:
                         if consecutive == 0 or recent_fail == 0:
                             self._last_core_traffic_trigger.pop(group_key, None)
                         continue
 
-                    signature = (updated_at, recent_total, recent_fail, consecutive)
+                    signature = (updated_at, recent_total, recent_fail, consecutive, last_reason)
                     if self._last_core_traffic_trigger.get(group_key) == signature:
                         continue
                     self._last_core_traffic_trigger[group_key] = signature
@@ -531,9 +533,13 @@ class BackendService:
                         f"group={group_name}, recent_total={recent_total}, "
                         f"recent_fail_count={recent_fail}, "
                         f"recent_failure_rate={fail_rate:.2f}, "
-                        f"consecutive_failures={consecutive}, updated_at={updated_at}"
+                        f"consecutive_failures={consecutive}, last_reason={last_reason or '-'}, "
+                        f"immediate_node_failure={immediate_node_failure}, updated_at={updated_at}"
                     )
-                    schedule_group_recovery(group_key, "go_core_metrics")
+                    schedule_group_recovery(
+                        group_key,
+                        f"go_core_metrics:{last_reason or 'threshold'}",
+                    )
 
                 for group_key in list(self._last_core_traffic_trigger):
                     if group_key not in active_groups:

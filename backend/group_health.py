@@ -16,6 +16,22 @@ CONTROLLER_FAIL_THRESHOLD = 3
 MONITOR_INTERVAL_SECONDS = 30
 RECOVERY_COOLDOWN_SECONDS = 60
 
+# These final reasons are emitted only after the Go core has ruled out normal
+# connection teardown. They are strong evidence that the currently selected
+# upstream node is unhealthy, so waiting for a second request just prolongs
+# the outage for the caller that already observed the failure.
+IMMEDIATE_NODE_FAILURE_REASONS = frozenset(
+    {
+        "no_response",
+        "quick_close_low_bytes",
+        "write_timeout",
+        "direct_write_fail",
+        "direct_write_timeout",
+        "relay_error",
+        "relay_shutdown_timeout",
+    }
+)
+
 _traffic_windows: dict[str, deque[bool]] = defaultdict(lambda: deque(maxlen=TRAFFIC_WINDOW_SIZE))
 _consecutive_failures: dict[str, int] = defaultdict(int)
 _listener_failures: dict[str, int] = defaultdict(int)
@@ -49,11 +65,39 @@ def record_proxy_connection_result(group_name: str, success: bool, reason: str =
         "WARN",
     )
 
-    if _should_recover_from_traffic(group_name):
+    if _should_recover_from_traffic(group_name, reason):
         _schedule_group_recovery(group_name, f"traffic:{reason or 'unknown'}")
 
 
-def _should_recover_from_traffic(group_name: str) -> bool:
+def is_immediate_node_failure_reason(reason: str) -> bool:
+    """Whether a final traffic reason warrants an immediate node switch."""
+    normalized = str(reason or "").strip().lower()
+    if ":" in normalized:
+        normalized = normalized.rsplit(":", 1)[-1]
+    return normalized in IMMEDIATE_NODE_FAILURE_REASONS
+
+
+def should_recover_from_core_metrics(
+    recent_total: int,
+    recent_fail_count: int,
+    consecutive_failures: int,
+    last_reason: str,
+) -> tuple[bool, bool]:
+    """Return (should_recover, is_immediate_node_failure) for Go-core metrics."""
+    immediate = consecutive_failures >= 1 and is_immediate_node_failure_reason(last_reason)
+    fail_rate = recent_fail_count / max(1, recent_total)
+    threshold_reached = (
+        recent_total >= TRAFFIC_WINDOW_SIZE
+        and recent_fail_count >= TRAFFIC_FAIL_THRESHOLD
+        and fail_rate >= TRAFFIC_FAIL_RATE_THRESHOLD
+    ) or consecutive_failures >= TRAFFIC_CONSECUTIVE_FAIL_THRESHOLD
+    return immediate or threshold_reached, immediate
+
+
+def _should_recover_from_traffic(group_name: str, reason: str = "") -> bool:
+    if is_immediate_node_failure_reason(reason):
+        return True
+
     window = _traffic_windows[group_name]
     fail_count = window.count(False)
     fail_rate = fail_count / max(1, len(window))
@@ -68,7 +112,8 @@ def _schedule_group_recovery(group_name: str, reason: str):
     now = time.monotonic()
     if group_name in _healing_groups:
         return
-    if now - _last_recovery_at.get(group_name, 0) < RECOVERY_COOLDOWN_SECONDS:
+    last_recovery = _last_recovery_at.get(group_name)
+    if last_recovery is not None and now - last_recovery < RECOVERY_COOLDOWN_SECONDS:
         return
 
     try:

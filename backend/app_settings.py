@@ -32,8 +32,7 @@ def get_default_app_settings() -> dict:
             "close_to_tray": True,
             "start_minimized": False,
             "auto_start_proxy": False,
-            "enable_system_proxy_on_start": True,
-            "disable_system_proxy_on_stop": True,
+            "auto_manage_system_proxy": True,
         },
         "logging": {
             "console_enabled": False,
@@ -138,7 +137,18 @@ def _load_app_settings_uncached() -> dict:
     ui = raw.get("ui", {})
     if isinstance(ui, dict):
         for key, default_value in defaults["ui"].items():
-            settings["ui"][key] = _to_bool(ui.get(key), default_value)
+            if key == "auto_manage_system_proxy" and key not in ui:
+                enable_on_start = _to_bool(
+                    ui.get("enable_system_proxy_on_start"),
+                    True,
+                )
+                disable_on_stop = _to_bool(
+                    ui.get("disable_system_proxy_on_stop"),
+                    True,
+                )
+                settings["ui"][key] = enable_on_start and disable_on_stop
+            else:
+                settings["ui"][key] = _to_bool(ui.get(key), default_value)
 
     logging_settings = raw.get("logging", {})
     if isinstance(logging_settings, dict):

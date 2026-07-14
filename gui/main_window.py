@@ -81,6 +81,7 @@ from gui.system_proxy_manager import (
 from gui.theme import APP_QSS, DANGER, MUTED, PRIMARY, SUCCESS, TEXT
 from gui.widgets.proxy_switch import ProxySwitch
 from backend.port_manager import prepare_mihomo_runtime_ports
+from backend.mihomo_paths import resolve_mihomo_exe_path
 from backend.delay_tester import cancel_delay_test, test_all_node_delays_via_main_controller
 from backend.activity_bus import set_activity_callback, write_log
 from backend.config_apply import (
@@ -114,7 +115,7 @@ class ProxyActionWorker(QObject):
             if self.action == "start":
                 write_log("lifecycle", "start_proxy_process called, reason=proxy_switch_or_tray_start")
                 ok, error = start_proxy_process()
-                if ok and load_app_settings().get("ui", {}).get("enable_system_proxy_on_start", True):
+                if ok and load_app_settings().get("ui", {}).get("auto_manage_system_proxy", True):
                     proxy_settings = load_app_settings().get("proxy", {})
                     host = str(proxy_settings.get("listen_host") or "127.0.0.1")
                     try:
@@ -129,7 +130,7 @@ class ProxyActionWorker(QObject):
                         ok = False
                         error = proxy_message or "系统代理启用失败"
             else:
-                if load_app_settings().get("ui", {}).get("disable_system_proxy_on_stop", True):
+                if load_app_settings().get("ui", {}).get("auto_manage_system_proxy", True):
                     proxy_settings = load_app_settings().get("proxy", {})
                     host = str(proxy_settings.get("listen_host") or "127.0.0.1")
                     try:
@@ -202,7 +203,6 @@ class MainWindow(QMainWindow):
         self.group_list = None
         self.group_name_input = None
         self.group_port_input = None
-        self.group_controller_input = None
         self.strategy_combo = None
         self.current_node_input = None
         self.group_node_table = None
@@ -520,6 +520,10 @@ class MainWindow(QMainWindow):
         item = self.nav.item(row)
         if item and item.text() == "仪表盘":
             self.refresh_dashboard()
+        if item and item.text() == "订阅管理":
+            self._refresh_subscription_table()
+        if item and item.text() == "节点池":
+            self._refresh_node_pool_table()
         if item and item.text() == "分组管理":
             self.refresh_group_management_page()
         if item and item.text() == "规则管理":
@@ -966,45 +970,6 @@ class MainWindow(QMainWindow):
 
         return reserved_ports
 
-    def _enable_system_proxy_if_configured(self) -> bool:
-        if not load_app_settings().get("ui", {}).get("enable_system_proxy_on_start", True):
-            return True
-
-        host, port = self._context_proxy_endpoint()
-        self._log_lifecycle_event(f"enable_system_proxy called, reason=start_proxy, endpoint={host}:{port}")
-        ok, message = enable_system_proxy(host, port)
-        if not ok:
-            self.notify_error(f"启用系统代理失败：{message}")
-            return False
-
-        self._append_activity_log("\u7cfb\u7edf\u4ee3\u7406\u5df2\u542f\u7528")
-        return True
-
-    def _disable_system_proxy_if_configured(self) -> bool:
-        if not load_app_settings().get("ui", {}).get("disable_system_proxy_on_stop", True):
-            return True
-
-        host, port = self._context_proxy_endpoint()
-        self._log_lifecycle_event(f"disable_system_proxy called, reason=stop_proxy, endpoint={host}:{port}")
-        if is_contextproxy_system_proxy("127.0.0.1", 18000):
-            ok, message = disable_system_proxy_if_contextproxy("127.0.0.1", 18000)
-            if not ok:
-                self.notify_error(f"关闭系统代理失败：{message}")
-                return False
-
-            if message:
-                self._append_activity_log(message)
-            return True
-
-        ok, message = disable_system_proxy_if_contextproxy(host, port)
-        if not ok:
-            self.notify_error(f"关闭系统代理失败：{message}")
-            return False
-
-        if message:
-            self._append_activity_log(message)
-        return True
-
     def _cleanup_stale_system_proxy_on_start(self):
         host, port = self._context_proxy_endpoint()
         if is_proxy_running():
@@ -1026,7 +991,7 @@ class MainWindow(QMainWindow):
             self._append_activity_log("[INFO] \u5df2\u6e05\u7406\u4e0a\u6b21\u6b8b\u7559\u7684\u7cfb\u7edf\u4ee3\u7406")
 
     def _disable_system_proxy_on_exit(self):
-        if not load_app_settings().get("ui", {}).get("disable_system_proxy_on_stop", True):
+        if not load_app_settings().get("ui", {}).get("auto_manage_system_proxy", True):
             return
 
         if is_contextproxy_system_proxy("127.0.0.1", 18000):
@@ -1313,21 +1278,32 @@ class MainWindow(QMainWindow):
         url = self.subscription_url_input.text().strip() if self.subscription_url_input else ""
 
         def task():
-            ok, error = update_subscription_from_gui(name, url)
+            ok, message = update_subscription_from_gui(name, url)
             if not ok:
-                raise RuntimeError(error or "未知错误")
-            return name
+                raise RuntimeError(message or "未知错误")
+            return name, message
 
-        def on_success(result_name):
+        def refresh_subscription_views():
             self._refresh_subscription_table()
             self._refresh_node_pool_table()
             self.refresh_group_management_page()
             self.refresh_dashboard()
-            self.notify_success(f"订阅更新成功：{result_name}")
+
+        def on_success(result):
+            result_name, warning = result
+            refresh_subscription_views()
+            if warning:
+                self.notify_warning(warning)
+            else:
+                self.notify_success(f"订阅更新成功：{result_name}")
+
+        def on_error(_error):
+            refresh_subscription_views()
 
         self.run_gui_task(
             task,
             on_success=on_success,
+            on_error=on_error,
             error_message="订阅更新失败",
             loading_message="正在更新订阅...",
             task_name="更新订阅",
@@ -1339,24 +1315,34 @@ class MainWindow(QMainWindow):
         name = self._selected_subscription_name()
 
         def task():
-            ok, error, messages = delete_subscription_from_gui(name)
+            ok, message, messages = delete_subscription_from_gui(name)
             if not ok:
-                raise RuntimeError(error or "未知错误")
-            return name, messages
+                raise RuntimeError(message or "未知错误")
+            return name, messages, message
 
-        def on_success(result):
-            result_name, messages = result
+        def refresh_subscription_views():
             self._refresh_subscription_table()
             self._refresh_node_pool_table()
             self.refresh_group_management_page()
             self.refresh_dashboard()
-            self.notify_success(f"订阅已删除，节点池和配置已同步：{result_name}")
+
+        def on_success(result):
+            result_name, messages, warning = result
+            refresh_subscription_views()
+            if warning:
+                self.notify_warning(warning)
+            else:
+                self.notify_success(f"订阅已删除，节点池和配置已同步：{result_name}")
             for message in messages:
                 self._append_activity_log(message)
+
+        def on_error(_error):
+            refresh_subscription_views()
 
         self.run_gui_task(
             task,
             on_success=on_success,
+            on_error=on_error,
             error_message="删除订阅失败",
             loading_message="正在删除订阅...",
             task_name="删除订阅",
@@ -1567,7 +1553,9 @@ class MainWindow(QMainWindow):
         title.setObjectName("SectionTitle")
         layout.addWidget(title)
 
-        self.group_readonly_hint = QLabel("代理运行中，分组配置暂不可修改。请先停止代理后再编辑分组。")
+        self.group_readonly_hint = QLabel(
+            "代理运行中，端口和分组结构不可修改；可勾选节点并保存应用。"
+        )
         self.group_readonly_hint.setObjectName("Muted")
         self.group_readonly_hint.setVisible(False)
         layout.addWidget(self.group_readonly_hint)
@@ -1580,8 +1568,7 @@ class MainWindow(QMainWindow):
         self.group_name_input.setReadOnly(True)
         self.group_port_input = QLineEdit("")
         self.group_port_input.setPlaceholderText("7891")
-        self.group_controller_input = QLineEdit("")
-        self.group_controller_input.setPlaceholderText("9090")
+        self.group_port_input.setToolTip("\u7aef\u53e3\u51b2\u7a81\u65f6\u4f1a\u81ea\u52a8\u91cd\u65b0\u5206\u914d")
         self.strategy_combo = QComboBox()
         self.strategy_combo.addItems(["\u81ea\u52a8\u9009\u62e9"])
         self.current_node_input = QLineEdit("\u6682\u65e0\u9009\u62e9")
@@ -1591,15 +1578,13 @@ class MainWindow(QMainWindow):
 
         form.addWidget(QLabel("\u5206\u7ec4\u540d\u79f0"), 0, 0)
         form.addWidget(QLabel("\u672c\u5730\u4ee3\u7406\u7aef\u53e3"), 0, 1)
-        form.addWidget(QLabel("external-controller"), 0, 2)
         form.addWidget(self.group_name_input, 1, 0)
         form.addWidget(self.group_port_input, 1, 1)
-        form.addWidget(self.group_controller_input, 1, 2)
-        form.addWidget(QLabel("\u9009\u62e9\u7b56\u7565"), 2, 0, 1, 3)
-        form.addWidget(self.strategy_combo, 3, 0, 1, 3)
-        form.addWidget(QLabel("\u5f53\u524d\u9009\u62e9\u8282\u70b9"), 4, 0, 1, 3)
-        form.addWidget(self.current_node_input, 5, 0, 1, 2)
-        form.addWidget(self.group_reselect_button, 5, 2)
+        form.addWidget(QLabel("\u9009\u62e9\u7b56\u7565"), 2, 0, 1, 2)
+        form.addWidget(self.strategy_combo, 3, 0, 1, 2)
+        form.addWidget(QLabel("\u5f53\u524d\u9009\u62e9\u8282\u70b9"), 4, 0, 1, 2)
+        form.addWidget(self.current_node_input, 5, 0)
+        form.addWidget(self.group_reselect_button, 5, 1)
         layout.addLayout(form)
 
         self.group_node_table = QTableWidget()
@@ -1649,40 +1634,37 @@ class MainWindow(QMainWindow):
         return groups if isinstance(groups, dict) else {}
 
     def _update_group_edit_state(self):
-        readonly = is_proxy_running()
+        running = is_proxy_running()
         for button in (
             self.group_new_button,
             self.group_delete_button,
-            self.group_save_button,
         ):
             if button:
-                button.setEnabled(not readonly)
+                button.setEnabled(not running)
+        if self.group_save_button:
+            self.group_save_button.setEnabled(True)
         if self.group_reselect_button:
-            self.group_reselect_button.setEnabled(bool(self.current_group_name) and readonly)
+            self.group_reselect_button.setEnabled(bool(self.current_group_name) and running)
         if self.group_readonly_hint:
-            if readonly:
+            if running:
                 self.group_readonly_hint.setText(
-                    "代理运行中，分组配置暂不可修改；可以使用“重新自动选择”切换当前分组节点。"
+                    "代理运行中，可勾选节点并保存应用；端口和分组结构不可修改。"
                 )
-            self.group_readonly_hint.setVisible(readonly)
+            self.group_readonly_hint.setVisible(running)
         if self.group_name_input:
             self.group_name_input.setReadOnly(True)
         if self.group_port_input:
-            self.group_port_input.setReadOnly(readonly)
-        if self.group_controller_input:
-            self.group_controller_input.setReadOnly(readonly)
+            self.group_port_input.setReadOnly(running)
         if self.strategy_combo:
-            self.strategy_combo.setEnabled(not readonly)
+            self.strategy_combo.setEnabled(not running)
         if self.group_node_table:
             for row_index in range(self.group_node_table.rowCount()):
                 item = self.group_node_table.item(row_index, 0)
                 if not item:
                     continue
                 flags = item.flags()
-                if readonly:
-                    flags &= ~Qt.ItemIsEnabled
-                else:
-                    flags |= Qt.ItemIsEnabled
+                flags |= Qt.ItemIsEnabled | Qt.ItemIsUserCheckable
+                flags &= ~Qt.ItemIsEditable
                 item.setFlags(flags)
 
     def _used_group_ports(self, excluded_group: str | None = None) -> set[int]:
@@ -1695,13 +1677,12 @@ class MainWindow(QMainWindow):
             if not isinstance(group_data, dict):
                 continue
 
-            for key in ("port", "controller"):
-                value = group_data.get(key)
-                try:
-                    if value not in (None, ""):
-                        used_ports.add(int(value))
-                except (TypeError, ValueError):
-                    continue
+            value = group_data.get("port")
+            try:
+                if value not in (None, ""):
+                    used_ports.add(int(value))
+            except (TypeError, ValueError):
+                continue
 
         return used_ports
 
@@ -1718,54 +1699,24 @@ class MainWindow(QMainWindow):
         return True
 
     def _allocate_available_port(self, start_port: int, used_ports: set[int], check_system: bool = True) -> int:
-        port = start_port
-        while port <= 65535:
+        start_port = start_port if 1 <= start_port <= 65535 else 1
+        for port in (*range(start_port, 65536), *range(1, start_port)):
             if port in used_ports:
-                port += 1
                 continue
             if check_system and not self._is_port_available(port):
-                port += 1
                 continue
-            break
+            used_ports.add(port)
+            return port
 
-        if port > 65535:
-            raise ValueError("\u6ca1\u6709\u53ef\u7528\u7aef\u53e3")
-
-        used_ports.add(port)
-        return port
+        raise ValueError("\u6ca1\u6709\u53ef\u7528\u7aef\u53e3")
 
     def _iter_config_port_entries(self):
         for group_name, group_data in self._group_map().items():
             if not isinstance(group_data, dict):
                 continue
-            for key in ("port", "controller"):
-                yield str(group_name), key, group_data.get(key)
+            yield str(group_name), "port", group_data.get("port")
 
     def _validate_group_ports_config_only(self, current_group: str | None = None) -> tuple[bool, str | None]:
-        settings = load_app_settings()
-        proxy_settings = settings.get("proxy", {})
-        mihomo_settings = settings.get("mihomo", {})
-        listener_reserved_ports = {18000, 17890}
-        controller_reserved_ports = {18000, 17890}
-
-        for key in ("listen_port", "receiver_port"):
-            try:
-                port = int(proxy_settings.get(key))
-            except (TypeError, ValueError):
-                continue
-            listener_reserved_ports.add(port)
-            controller_reserved_ports.add(port)
-
-        for key in ("controller_port", "mixed_port"):
-            try:
-                listener_reserved_ports.add(int(mihomo_settings.get(key)))
-            except (TypeError, ValueError):
-                continue
-
-        listener_reserved_text = " / ".join(str(port) for port in sorted(listener_reserved_ports))
-        controller_reserved_text = " / ".join(str(port) for port in sorted(controller_reserved_ports))
-        seen = {}
-
         for group_name, key, raw_value in self._iter_config_port_entries():
             try:
                 port = int(raw_value)
@@ -1774,29 +1725,6 @@ class MainWindow(QMainWindow):
 
             if port < 1 or port > 65535:
                 return False, f"{group_name} {key} 范围必须是 1-65535"
-
-            if key == "port" and port in listener_reserved_ports:
-                return False, f"{group_name} listener 端口不能使用保留端口 {listener_reserved_text}"
-
-            if key == "controller" and port in controller_reserved_ports:
-                return False, f"{group_name} external-controller 不能使用保留端口 {controller_reserved_text}"
-
-            owner = seen.get(port)
-            if owner:
-                return False, f"{group_name} {key} 与 {owner[0]} {owner[1]} 端口重复"
-
-            seen[port] = (group_name, key)
-
-        for group_name, group_data in self._group_map().items():
-            if not isinstance(group_data, dict):
-                continue
-            try:
-                port = int(group_data.get("port"))
-                controller = int(group_data.get("controller"))
-            except (TypeError, ValueError):
-                continue
-            if port == controller:
-                return False, f"{group_name} 本地代理端口和 external-controller 不能相同"
 
         _ = current_group
         return True, None
@@ -1914,8 +1842,6 @@ class MainWindow(QMainWindow):
         if not group_name:
             if self.group_port_input:
                 self.group_port_input.clear()
-            if self.group_controller_input:
-                self.group_controller_input.clear()
             if self.current_node_input:
                 self.current_node_input.setText("\u6682\u65e0\u9009\u62e9")
             if self.group_node_table:
@@ -1928,8 +1854,6 @@ class MainWindow(QMainWindow):
         if self.group_port_input:
             self.group_port_input.setText(str(group_data.get("port") or ""))
 
-        if self.group_controller_input:
-            self.group_controller_input.setText(str(group_data.get("controller") or ""))
 
         if self.current_node_input:
             self.current_node_input.setText(self._selected_node_display(group_name, nodes))
@@ -1976,15 +1900,12 @@ class MainWindow(QMainWindow):
         table.blockSignals(True)
         try:
             table.setRowCount(len(self.node_pool_nodes))
-            readonly = is_proxy_running()
             for row_index, (fallback_name, node) in enumerate(self.node_pool_nodes.items()):
                 node = node if isinstance(node, dict) else {}
                 node_name = str(node.get("name") or fallback_name)
                 check_item = QTableWidgetItem()
                 flags = check_item.flags() | Qt.ItemIsUserCheckable
                 flags &= ~Qt.ItemIsEditable
-                if readonly:
-                    flags &= ~Qt.ItemIsEnabled
                 check_item.setFlags(flags)
                 check_item.setCheckState(Qt.Checked if node_name in selected_nodes else Qt.Unchecked)
                 check_item.setTextAlignment(Qt.AlignCenter)
@@ -2016,88 +1937,25 @@ class MainWindow(QMainWindow):
                 checked.append(node_item.text())
         return checked
 
-    def _validate_current_group_ports(self) -> tuple[bool, str | None, int | None, int | None, list[str]]:
+    def _validate_current_group_ports(self) -> tuple[bool, str | None, int | None]:
         port_text = self.group_port_input.text().strip() if self.group_port_input else ""
-        controller_text = self.group_controller_input.text().strip() if self.group_controller_input else ""
-        settings = load_app_settings()
-        proxy_settings = settings.get("proxy", {})
-        mihomo_settings = settings.get("mihomo", {})
-        listener_reserved_ports = {18000, 17890}
-        controller_reserved_ports = {18000, 17890}
-
-        for key in ("listen_port", "receiver_port"):
-            try:
-                value = int(proxy_settings.get(key))
-            except (TypeError, ValueError):
-                continue
-            listener_reserved_ports.add(value)
-            controller_reserved_ports.add(value)
-
-        for key in ("controller_port", "mixed_port"):
-            try:
-                listener_reserved_ports.add(int(mihomo_settings.get(key)))
-            except (TypeError, ValueError):
-                continue
-
-        listener_reserved_text = " / ".join(str(port) for port in sorted(listener_reserved_ports))
-        controller_reserved_text = " / ".join(str(port) for port in sorted(controller_reserved_ports))
 
         if not port_text.isdigit():
-            return False, "\u672c\u5730\u4ee3\u7406\u7aef\u53e3\u5fc5\u987b\u662f\u6570\u5b57", None, None, []
-
-        if not controller_text.isdigit():
-            return False, "external-controller \u5fc5\u987b\u662f\u6570\u5b57", None, None, []
+            return False, "\u672c\u5730\u4ee3\u7406\u7aef\u53e3\u5fc5\u987b\u662f\u6570\u5b57", None
 
         port = int(port_text)
-        controller = int(controller_text)
 
         if port < 1 or port > 65535:
-            return False, "\u672c\u5730\u4ee3\u7406\u7aef\u53e3\u8303\u56f4\u5fc5\u987b\u662f 1-65535", None, None, []
+            return False, "\u672c\u5730\u4ee3\u7406\u7aef\u53e3\u8303\u56f4\u5fc5\u987b\u662f 1-65535", None
 
-        if controller < 1 or controller > 65535:
-            return False, "external-controller \u8303\u56f4\u5fc5\u987b\u662f 1-65535", None, None, []
-
-        if port == controller:
-            return False, "\u672c\u5730\u4ee3\u7406\u7aef\u53e3\u548c external-controller \u4e0d\u80fd\u76f8\u540c", None, None, []
-
-        if port in listener_reserved_ports:
-            return False, f"\u672c\u5730\u4ee3\u7406\u7aef\u53e3\u4e0d\u80fd\u4f7f\u7528\u4fdd\u7559\u7aef\u53e3 {listener_reserved_text}", None, None, []
-
-        if controller in controller_reserved_ports:
-            return False, f"external-controller \u4e0d\u80fd\u4f7f\u7528\u4fdd\u7559\u7aef\u53e3 {controller_reserved_text}", None, None, []
-
-        for group_name, group_data in self._group_map().items():
-            if group_name == self.current_group_name or not isinstance(group_data, dict):
-                continue
-
-            other_port = group_data.get("port")
-            other_controller = group_data.get("controller")
-
-            try:
-                other_port = int(other_port) if other_port not in (None, "") else None
-            except (TypeError, ValueError):
-                other_port = None
-
-            try:
-                other_controller = int(other_controller) if other_controller not in (None, "") else None
-            except (TypeError, ValueError):
-                other_controller = None
-
-            if other_port == port or other_controller == port:
-                return False, f"\u672c\u5730\u4ee3\u7406\u7aef\u53e3\u4e0e\u5206\u7ec4 {group_name} \u91cd\u590d", None, None, []
-
-            if other_controller == controller or other_port == controller:
-                return False, f"external-controller \u4e0e\u5206\u7ec4 {group_name} \u91cd\u590d", None, None, []
-
-        return True, None, port, controller, []
+        # Group listener collisions are resolved by the runtime allocator when
+        # the config is applied, rather than rejected in the editor.
+        return True, None, port
 
     def _save_current_group_nodes(self):
         if self.busy:
             return
-        if is_proxy_running():
-            self._append_activity_log("[WARN] 代理运行中，无法修改分组配置")
-            self._update_group_edit_state()
-            return
+        running = is_proxy_running()
 
         if not self.current_group_name:
             self.notify_info("请先选择一个分组")
@@ -2109,10 +1967,20 @@ class MainWindow(QMainWindow):
             self.notify_warning("当前分组不存在")
             return
 
-        valid, validation_error, port, controller, adjusted_ports = self._validate_current_group_ports()
+        valid, validation_error, port = self._validate_current_group_ports()
         if not valid:
             self.notify_warning(validation_error or "端口校验失败")
             return
+
+        if running:
+            try:
+                existing_port = int(group_data.get("port"))
+            except (TypeError, ValueError):
+                self.notify_warning("当前分组端口无效，无法在代理运行中保存")
+                return
+            if port != existing_port:
+                self.notify_warning("代理运行中不能修改分组端口")
+                return
 
         config_to_save = copy.deepcopy(self.group_nodes_config)
         save_groups = config_to_save.get("groups", {})
@@ -2123,23 +1991,37 @@ class MainWindow(QMainWindow):
         checked_nodes = self._checked_group_nodes()
         save_group_data["nodes"] = checked_nodes
         save_group_data["port"] = port
-        save_group_data["controller"] = controller
+        save_group_data.pop("controller", None)
         current_group_name = self.current_group_name
-        _ = adjusted_ports
 
         def task():
-            save_group_nodes_and_apply(config_to_save, allow_running=False, reason=f"group_save:{current_group_name}")
-            return config_to_save, current_group_name, len(checked_nodes)
+            save_group_nodes_and_apply(
+                config_to_save,
+                allow_running=running,
+                reason=f"group_nodes_save:{current_group_name}",
+            )
+            return current_group_name, len(checked_nodes), port, running
 
         def on_success(result):
-            saved_config, group_name, node_count = result
-            self.group_nodes_config = saved_config
+            group_name, node_count, requested_port, was_running = result
+            self._load_group_management_data()
+            actual_port = self._current_group_data(group_name).get("port")
             self._show_group(group_name)
             self.refresh_dashboard()
-            self._append_activity_log(
-                f"[INFO]  分组 {group_name} 已保存，配置已自动生成，节点数 {node_count}"
-            )
-            self.notify_success("分组已保存，配置已自动生成")
+            if actual_port != requested_port:
+                self._append_activity_log(
+                    f"[INFO]  分组 {group_name} 端口冲突，已自动分配为 {actual_port}"
+                )
+            if was_running:
+                self._append_activity_log(
+                    f"[INFO]  分组 {group_name} 节点已保存并已重载 Mihomo，节点数 {node_count}"
+                )
+                self.notify_success("节点选择已保存并应用")
+            else:
+                self._append_activity_log(
+                    f"[INFO]  分组 {group_name} 已保存，配置已自动生成，节点数 {node_count}"
+                )
+                self.notify_success("分组已保存，配置已自动生成")
 
         self.run_gui_task(
             task,
@@ -2184,7 +2066,6 @@ class MainWindow(QMainWindow):
             used_ports = self._used_group_ports()
             check_system_ports = not is_proxy_running()
             port = self._allocate_available_port(7894, used_ports, check_system=check_system_ports)
-            controller = self._allocate_available_port(9094, used_ports, check_system=check_system_ports)
         except ValueError as exc:
             self.notify_error(str(exc))
             return
@@ -2195,7 +2076,6 @@ class MainWindow(QMainWindow):
 
         config_to_save["groups"][group_name] = {
             "port": port,
-            "controller": controller,
             "nodes": [],
         }
 
@@ -2206,7 +2086,7 @@ class MainWindow(QMainWindow):
         def on_success(saved_config):
             self.group_nodes_config = saved_config
             self._refresh_after_group_structure_changed(group_name)
-            self._append_activity_log(f"[INFO]  分组 {group_name} 已创建，port={port}, controller={controller}")
+            self._append_activity_log(f"[INFO]  分组 {group_name} 已创建，port={port}")
             self.notify_success("分组已创建，请勾选节点后保存并应用")
 
         self.run_gui_task(
@@ -2738,6 +2618,8 @@ class MainWindow(QMainWindow):
             )
         )
 
+        layout.addWidget(self._mihomo_executable_card(settings))
+
         layout.addWidget(
             self._settings_form_card(
                 "\u8282\u70b9\u6c60\u624b\u52a8\u6d4b\u901f",
@@ -2761,8 +2643,10 @@ class MainWindow(QMainWindow):
             ("ui.close_to_tray", "\u5173\u95ed\u7a97\u53e3\u6700\u5c0f\u5316\u5230\u6258\u76d8"),
             ("ui.start_minimized", "\u542f\u52a8\u65f6\u6700\u5c0f\u5316"),
             ("ui.auto_start_proxy", "\u542f\u52a8 GUI \u540e\u81ea\u52a8\u542f\u52a8\u4ee3\u7406"),
-            ("ui.enable_system_proxy_on_start", "\u542f\u52a8\u4ee3\u7406\u65f6\u542f\u7528\u7cfb\u7edf\u4ee3\u7406"),
-            ("ui.disable_system_proxy_on_stop", "\u505c\u6b62\u4ee3\u7406\u65f6\u5173\u95ed\u7cfb\u7edf\u4ee3\u7406"),
+            (
+                "ui.auto_manage_system_proxy",
+                "\u81ea\u52a8\u7ba1\u7406\u7cfb\u7edf\u4ee3\u7406\uff08\u542f\u52a8\u65f6\u542f\u7528\uff0c\u505c\u6b62\u65f6\u5173\u95ed\uff09",
+            ),
         ]:
             checkbox = QCheckBox(label_text)
             checkbox.setChecked(bool(self._setting_value(settings, key)))
@@ -2808,6 +2692,62 @@ class MainWindow(QMainWindow):
         inner.addLayout(form)
         return card
 
+    def _mihomo_executable_card(self, settings: dict):
+        card = self._card()
+        inner = QVBoxLayout(card)
+        inner.setContentsMargins(16, 16, 16, 16)
+        inner.setSpacing(12)
+
+        title = QLabel("Mihomo \u6838\u5fc3")
+        title.setObjectName("SectionTitle")
+        inner.addWidget(title)
+
+        path_layout = QHBoxLayout()
+        executable_input = QLineEdit(str(self._setting_value(settings, "mihomo.exe") or ""))
+        executable_input.setPlaceholderText(str(PROJECT_ROOT / "mihomo" / "mihomo.exe"))
+        self.setting_inputs["mihomo.exe"] = executable_input
+        path_layout.addWidget(executable_input, 1)
+
+        select_button = QPushButton("\u9009\u62e9\u6587\u4ef6...")
+        select_button.clicked.connect(self._select_mihomo_executable)
+        path_layout.addWidget(select_button)
+
+        clear_button = QPushButton("\u6e05\u9664")
+        clear_button.clicked.connect(lambda: executable_input.clear())
+        path_layout.addWidget(clear_button)
+        inner.addLayout(path_layout)
+
+        hint = QLabel(
+            "\u9009\u62e9\u672c\u673a mihomo \u53ef\u6267\u884c\u6587\u4ef6\uff08.exe\uff09\u3002"
+            "\u8def\u5f84\u4f1a\u4fdd\u5b58\u5230\u8bbe\u7f6e\uff1b\u7559\u7a7a\u65f6\u4ecd\u6309\u65e7\u76ee\u5f55\u9ed8\u8ba4\u6587\u4ef6\u540d\u67e5\u627e\u3002"
+        )
+        hint.setObjectName("Muted")
+        hint.setWordWrap(True)
+        inner.addWidget(hint)
+        return card
+
+    def _select_mihomo_executable(self):
+        executable_input = self.setting_inputs.get("mihomo.exe")
+        if not executable_input:
+            return
+
+        configured_path = executable_input.text().strip()
+        if configured_path:
+            start_dir = resolve_mihomo_exe_path(configured_path).parent
+        else:
+            start_dir = PROJECT_ROOT / "mihomo"
+        if not start_dir.is_dir():
+            start_dir = PROJECT_ROOT
+
+        selected_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "\u9009\u62e9 Mihomo \u53ef\u6267\u884c\u6587\u4ef6",
+            str(start_dir),
+            "Mihomo executable (*.exe);;All files (*)",
+        )
+        if selected_path:
+            executable_input.setText(str(Path(selected_path)))
+
     def _setting_value(self, settings: dict, dotted_key: str):
         section, key = dotted_key.split(".", 1)
         section_data = settings.get(section, {})
@@ -2832,6 +2772,17 @@ class MainWindow(QMainWindow):
         if None in (listen_port, receiver_port, delay_timeout_ms):
             return
 
+        mihomo_exe = self.setting_inputs["mihomo.exe"].text().strip()
+        if mihomo_exe:
+            resolved_mihomo_exe = resolve_mihomo_exe_path(mihomo_exe)
+            if not resolved_mihomo_exe.is_file():
+                self.notify_warning(f"mihomo \u53ef\u6267\u884c\u6587\u4ef6\u4e0d\u5b58\u5728\uff1a{resolved_mihomo_exe}")
+                return
+
+        previous_mihomo = previous_settings.get("mihomo", {})
+        mihomo_settings = dict(previous_mihomo) if isinstance(previous_mihomo, dict) else {}
+        mihomo_settings["exe"] = mihomo_exe
+
         settings = {
             "proxy": {
                 "listen_host": self.setting_inputs["proxy.listen_host"].text().strip(),
@@ -2842,13 +2793,14 @@ class MainWindow(QMainWindow):
                 "timeout_ms": delay_timeout_ms,
                 "test_url": self.setting_inputs["latency_test.test_url"].text().strip(),
             },
-            "mihomo": previous_settings.get("mihomo", {}),
+            "mihomo": mihomo_settings,
             "ui": {
                 "close_to_tray": self.setting_checks["ui.close_to_tray"].isChecked(),
                 "start_minimized": self.setting_checks["ui.start_minimized"].isChecked(),
                 "auto_start_proxy": self.setting_checks["ui.auto_start_proxy"].isChecked(),
-                "enable_system_proxy_on_start": self.setting_checks["ui.enable_system_proxy_on_start"].isChecked(),
-                "disable_system_proxy_on_stop": self.setting_checks["ui.disable_system_proxy_on_stop"].isChecked(),
+                "auto_manage_system_proxy": self.setting_checks[
+                    "ui.auto_manage_system_proxy"
+                ].isChecked(),
             },
             "logging": previous_settings.get("logging", {}),
         }

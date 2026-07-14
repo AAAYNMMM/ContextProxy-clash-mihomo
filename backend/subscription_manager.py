@@ -26,16 +26,32 @@ ADD_SUB_NAME_TO_NODE_NAME = True
 OUTPUT_DIR = CONFIG_DIR / "subscriptions"
 
 
-def refresh_after_subscription_changed():
+def refresh_after_subscription_changed() -> str | None:
+    """Rebuild persisted subscription state and best-effort apply it at runtime.
+
+    Rebuilding the node pool and group references is part of the subscription
+    transaction and must still raise on failure. Runtime application is a
+    separate concern: users must be able to see, update, and delete a saved
+    subscription even when mihomo is unavailable or rejects the generated
+    runtime config.
+    """
     from backend.config_apply import apply_core_config_change, apply_mihomo_config_change
 
     rebuild_node_pool()
     sync_group_nodes_with_node_pool()
-    apply_mihomo_config_change("subscription_changed")
-    ok, error, _payload = apply_core_config_change()
-    if not ok:
-        raise RuntimeError(error or "Go core reload 失败，订阅变更尚未生效")
+
+    try:
+        apply_mihomo_config_change("subscription_changed")
+        ok, error, _payload = apply_core_config_change()
+        if not ok:
+            raise RuntimeError(error or "Go core reload 失败")
+    except Exception as exc:
+        warning = str(exc) or "运行配置应用失败"
+        print(f"[subscription] persisted state synced, runtime apply deferred: {warning}")
+        return warning
+
     print("[subscription] node pool, group nodes and mihomo config synced")
+    return None
 
 
 def safe_filename(name: str) -> str:

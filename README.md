@@ -42,6 +42,18 @@ ContextProxy 的核心优势是“按上下文分流”，而不是传统代理�
 
 ---
 
+## Firefox 扩展
+
+Firefox 使用 .xpi 包安装扩展。在项目根目录运行：
+
+    powershell -ExecutionPolicy Bypass -File .\scripts\package-firefox-extension.ps1
+
+生成文件位于 dist/ContextProxy-Reporter-firefox-<version>.xpi。该包已包含 Firefox 的后台脚本兼容配置和固定 Gecko 扩展 ID。
+
+Firefox 正式版和 Beta 版只能安装 Mozilla 签名后的 XPI；脚本生成的是待签名包。开发版、Nightly 或按企业策略配置的 ESR 可用于未签名测试。签名后可通过 AMO 的自分发渠道或文件安装方式分发。
+
+---
+
 ## 本项目不实现 TUN 模式。
 
 原因：

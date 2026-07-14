@@ -6,8 +6,7 @@ from backend.local_http import local_delete, local_get
 from backend.runtime_config import get_group_port_map
 
 
-def get_controller_port(group_name: str | None = None):
-    _ = group_name
+def get_controller_port():
     return get_mihomo_controller_port()
 
 
