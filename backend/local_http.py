@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import atexit
 import threading
+import weakref
 
 import requests
 
 
 _thread_local = threading.local()
 _sessions_lock = threading.Lock()
-_sessions: set[requests.Session] = set()
+_sessions: weakref.WeakSet[requests.Session] = weakref.WeakSet()
 
 
 def local_session() -> requests.Session:
@@ -16,7 +17,8 @@ def local_session() -> requests.Session:
 
     Local control-plane requests are frequent and always target loopback. Reusing
     the Session keeps HTTP connections warm without sharing a requests.Session
-    across threads.
+    across threads. Weak references prevent short-lived worker threads from
+    leaving completed Sessions retained for the lifetime of the application.
     """
     session = getattr(_thread_local, "session", None)
     if session is None:
