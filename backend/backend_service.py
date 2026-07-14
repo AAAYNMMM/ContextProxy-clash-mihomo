@@ -4,7 +4,6 @@ import sys
 import threading
 import time
 import traceback
-from datetime import datetime
 from concurrent.futures import TimeoutError as FutureTimeoutError
 
 from backend.app_settings import get_mihomo_controller_port
@@ -13,11 +12,10 @@ from backend.core_config import get_core_listen_settings
 from backend.core_launcher import core_health_ok, is_core_available, is_core_running, start_core, stop_core
 from backend.local_http import local_get
 from backend.mihomo_launcher import launch_mihomo_all, stop_all_mihomo
-from backend.paths import LOGS_DIR
+from backend.activity_bus import write_log
+from backend.runtime_snapshot import clear_core_metrics, update_core_metrics
 from backend.group_health import start_group_health_monitor, stop_group_health_monitor
 
-
-LOG_FILE = LOGS_DIR / "backend_service.log"
 
 
 class BackendService:
@@ -39,7 +37,6 @@ class BackendService:
         self.stopped_event = threading.Event()
         self._loop_ready_event = threading.Event()
         self._state_lock = threading.RLock()
-        self._log_lock = threading.Lock()
         self.core_mode = False
         self._last_core_traffic_trigger: dict[str, tuple[int, int, int, int]] = {}
 
@@ -171,11 +168,7 @@ class BackendService:
             self.log(f"[BackendService] residual mihomo cleanup failed: {exc}")
 
     def log(self, message: str):
-        LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        with self._log_lock:
-            with open(LOG_FILE, "a", encoding="utf-8") as file:
-                file.write(f"{timestamp} {message}\n")
+        write_log("backend_service", message, "INFO")
 
     def _ensure_loop_thread(self):
         if self._thread_alive() and self.loop and self.loop.is_running():
@@ -349,6 +342,7 @@ class BackendService:
             await asyncio.gather(*tasks, return_exceptions=True)
 
         self.tasks.clear()
+        clear_core_metrics()
 
         try:
             stop_all_mihomo()
@@ -465,7 +459,7 @@ class BackendService:
                     return
                 raise RuntimeError("contextproxy core process exited")
 
-            health_ok = core_health_ok(timeout=0.8)
+            health_ok = await asyncio.to_thread(core_health_ok, timeout=0.8)
             if self._is_stopping_or_stopped():
                 self.log("[BackendService] contextproxy core monitor stopped because backend is stopping")
                 return
@@ -485,16 +479,22 @@ class BackendService:
         from backend.group_health import schedule_group_recovery
 
         while True:
-            await asyncio.sleep(5)
+            await asyncio.sleep(2)
             if not self.core_mode or not is_core_running():
                 continue
 
             try:
                 _proxy_host, _proxy_port, api_host, api_port = get_core_listen_settings()
-                response = local_get(f"http://{api_host}:{api_port}/metrics", timeout=1)
+                response = await asyncio.to_thread(
+                    local_get,
+                    f"http://{api_host}:{api_port}/metrics",
+                    timeout=1,
+                )
                 if response.status_code != 200:
                     continue
                 data = response.json()
+                if isinstance(data, dict):
+                    update_core_metrics(data)
                 traffic = data.get("traffic", {}) if isinstance(data, dict) else {}
                 if not isinstance(traffic, dict):
                     continue

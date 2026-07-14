@@ -1,10 +1,15 @@
 from copy import deepcopy
 from pathlib import Path
+import threading
 
 from backend.paths import CONFIG_DIR
 
 
 APP_SETTINGS_FILE = CONFIG_DIR / "app_settings.yaml"
+
+_cache_lock = threading.RLock()
+_cache_mtime_ns: int | None = None
+_cache_settings: dict | None = None
 
 
 def get_default_app_settings() -> dict:
@@ -78,7 +83,7 @@ def _to_bool(value, default: bool) -> bool:
     return default
 
 
-def load_app_settings() -> dict:
+def _load_app_settings_uncached() -> dict:
     defaults = get_default_app_settings()
     raw = _load_yaml(APP_SETTINGS_FILE)
     settings = deepcopy(defaults)
@@ -152,6 +157,34 @@ def load_app_settings() -> dict:
         )
 
     return settings
+
+
+def _settings_mtime_ns() -> int | None:
+    try:
+        return APP_SETTINGS_FILE.stat().st_mtime_ns
+    except OSError:
+        return None
+
+
+def clear_app_settings_cache() -> None:
+    global _cache_mtime_ns, _cache_settings
+    with _cache_lock:
+        _cache_mtime_ns = None
+        _cache_settings = None
+
+
+def load_app_settings() -> dict:
+    global _cache_mtime_ns, _cache_settings
+    mtime_ns = _settings_mtime_ns()
+    with _cache_lock:
+        if _cache_settings is not None and _cache_mtime_ns == mtime_ns:
+            return deepcopy(_cache_settings)
+
+    settings = _load_app_settings_uncached()
+    with _cache_lock:
+        _cache_settings = settings
+        _cache_mtime_ns = mtime_ns
+        return deepcopy(settings)
 
 
 def get_proxy_settings() -> dict:

@@ -2790,7 +2790,27 @@ func (c *Core) adaptiveRelay(dst net.Conn, src io.Reader, id uint64, inDirection
 	settings := c.transferSettings()
 	high := false
 	buf := c.getRelayBuffer(settings.normalBufferSize, false)
+	writer := newTimedConnWriter(dst, settings.writeTimeout)
+	connInfo := c.getConn(id)
+	pendingBytes := int64(0)
+	lastStatsFlush := time.Now()
+	flushStats := func(force bool, now time.Time) {
+		if pendingBytes == 0 {
+			return
+		}
+		if !force && pendingBytes < 256*1024 && now.Sub(lastStatsFlush) < 250*time.Millisecond {
+			return
+		}
+		if inDirection {
+			c.addBytes(id, pendingBytes, 0)
+		} else {
+			c.addBytes(id, 0, pendingBytes)
+		}
+		pendingBytes = 0
+		lastStatsFlush = now
+	}
 	defer func() {
+		flushStats(true, time.Now())
 		if high {
 			c.highThroughputDisabledCount.Add(1)
 			c.activeHighThroughputDirections.Add(-1)
@@ -2806,16 +2826,16 @@ func (c *Core) adaptiveRelay(dst net.Conn, src io.Reader, id uint64, inDirection
 		n, readErr := src.Read(buf)
 		if n > 0 {
 			data := buf[:n]
-			if err := writeFull(dst, data, settings.writeTimeout); err != nil {
+			if err := writer.writeFull(data); err != nil {
 				return err
 			}
-			if inDirection {
-				c.addBytes(id, int64(n), 0)
-			} else {
-				c.addBytes(id, 0, int64(n))
-			}
+			pendingBytes += int64(n)
 			windowBytes += int64(n)
 			now := time.Now()
+			if connInfo.ID != 0 {
+				connInfo.LastActiveAt.Store(now.UnixNano())
+			}
+			flushStats(false, now)
 			if !high && now.Sub(windowStart) <= settings.highWindow && windowBytes >= settings.highBytes {
 				c.putRelayBuffer(buf, false)
 				buf = c.getRelayBuffer(settings.highBufferSize, true)
@@ -2853,11 +2873,48 @@ func (c *Core) adaptiveRelay(dst net.Conn, src io.Reader, id uint64, inDirection
 	}
 }
 
+type timedConnWriter struct {
+	conn            net.Conn
+	timeout         time.Duration
+	refreshInterval time.Duration
+	nextRefresh     time.Time
+}
+
+func newTimedConnWriter(conn net.Conn, timeout time.Duration) *timedConnWriter {
+	refreshInterval := timeout / 3
+	if refreshInterval < time.Second {
+		refreshInterval = time.Second
+	}
+	if refreshInterval > 5*time.Second {
+		refreshInterval = 5 * time.Second
+	}
+	return &timedConnWriter{conn: conn, timeout: timeout, refreshInterval: refreshInterval}
+}
+
+func (w *timedConnWriter) writeFull(data []byte) error {
+	if w.timeout > 0 {
+		now := time.Now()
+		if w.nextRefresh.IsZero() || !now.Before(w.nextRefresh) {
+			if err := w.conn.SetWriteDeadline(now.Add(w.timeout)); err != nil {
+				return err
+			}
+			w.nextRefresh = now.Add(w.refreshInterval)
+		}
+	}
+	return writeFullRaw(w.conn, data)
+}
+
 func writeFull(dst net.Conn, data []byte, timeout time.Duration) error {
 	if timeout > 0 {
-		_ = dst.SetWriteDeadline(time.Now().Add(timeout))
+		if err := dst.SetWriteDeadline(time.Now().Add(timeout)); err != nil {
+			return err
+		}
 		defer dst.SetWriteDeadline(time.Time{})
 	}
+	return writeFullRaw(dst, data)
+}
+
+func writeFullRaw(dst net.Conn, data []byte) error {
 	for len(data) > 0 {
 		n, err := dst.Write(data)
 		if err != nil {
