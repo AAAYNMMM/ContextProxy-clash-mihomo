@@ -1,0 +1,8 @@
+already applied: dashboard imports
+backend error import: matches=0
+Traceback (most recent call last):
+  File "D:\a\_temp\final-review-fixes.py", line 21, in <module>
+    replace_once(main, "    get_backend_error,\n", "", "backend error import")
+  File "D:\a\_temp\final-review-fixes.py", line 11, in replace_once
+    raise RuntimeError(f"{path}: {label} expected one match, found {count}")
+RuntimeError: gui\main_window.py: backend error import expected one match, found 0
