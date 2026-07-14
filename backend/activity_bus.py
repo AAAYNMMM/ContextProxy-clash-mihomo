@@ -6,7 +6,7 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Callable
+from typing import Callable, TextIO
 
 from backend.paths import LOGS_DIR
 
@@ -23,7 +23,7 @@ _last_emit_at: dict[str, float] = {}
 class _AsyncLogWriter:
     def __init__(self) -> None:
         self._queue: queue.Queue[tuple[Path, str] | None] = queue.Queue(maxsize=LOG_QUEUE_SIZE)
-        self._files: dict[Path, object] = {}
+        self._files: dict[Path, TextIO] = {}
         self._lock = threading.Lock()
         self._closed = False
         self._dropped = 0
@@ -40,10 +40,22 @@ class _AsyncLogWriter:
             with self._lock:
                 self._dropped += 1
 
-    def _open_file(self, path: Path):
+    def _open_file(self, path: Path) -> TextIO:
         handle = self._files.get(path)
         if handle is not None:
-            return handle
+            try:
+                if handle.tell() < MAX_LOG_FILE_BYTES:
+                    return handle
+                handle.flush()
+                handle.close()
+            except Exception:
+                try:
+                    handle.close()
+                except Exception:
+                    pass
+            self._files.pop(path, None)
+            self._rotate(path)
+
         path.parent.mkdir(parents=True, exist_ok=True)
         self._rotate(path)
         handle = open(path, "a", encoding="utf-8", errors="replace", buffering=1)
@@ -67,6 +79,14 @@ class _AsyncLogWriter:
             except Exception:
                 pass
 
+    def _write_item(self, path: Path, message: str) -> None:
+        try:
+            handle = self._open_file(path)
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            handle.write(f"{timestamp} {message}\n")
+        except Exception:
+            pass
+
     def _run(self) -> None:
         while True:
             try:
@@ -78,14 +98,8 @@ class _AsyncLogWriter:
                 self._queue.task_done()
                 break
             path, message = item
-            try:
-                handle = self._open_file(path)
-                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                handle.write(f"{timestamp} {message}\n")
-            except Exception:
-                pass
-            finally:
-                self._queue.task_done()
+            self._write_item(path, message)
+            self._queue.task_done()
 
         while True:
             try:
@@ -93,25 +107,17 @@ class _AsyncLogWriter:
             except queue.Empty:
                 break
             if item is not None:
-                path, message = item
-                try:
-                    handle = self._open_file(path)
-                    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    handle.write(f"{timestamp} {message}\n")
-                except Exception:
-                    pass
+                self._write_item(*item)
             self._queue.task_done()
 
-        dropped = 0
         with self._lock:
             dropped = self._dropped
         if dropped:
-            try:
-                handle = self._open_file(LOG_DIR / "activity.log")
-                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                handle.write(f"{timestamp} [WARN] asynchronous log queue dropped {dropped} entries\n")
-            except Exception:
-                pass
+            self._write_item(
+                LOG_DIR / "activity.log",
+                f"[WARN] asynchronous log queue dropped {dropped} entries",
+            )
+
         self._flush()
         for handle in list(self._files.values()):
             try:
