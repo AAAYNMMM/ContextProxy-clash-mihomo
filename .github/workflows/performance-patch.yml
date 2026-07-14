@@ -1,4 +1,5 @@
 # Temporary branch-local trigger; removed by the validation driver.
+# Validation attempt: 2
 name: Apply performance smoothness patch
 
 on:
