@@ -17,17 +17,14 @@ NODE_POOL_FILE = CONFIG_DIR / "node_pool.yaml"
 DEFAULT_GROUPS = {
     "Proxy": {
         "port": 7890,
-        "controller": 9090,
         "nodes": [],
     },
     "AI": {
         "port": 7891,
-        "controller": 9091,
         "nodes": [],
     },
     "Media": {
         "port": 7892,
-        "controller": 9092,
         "nodes": [],
     },
 }
@@ -104,10 +101,9 @@ def list_groups():
     for group_name, group_data in groups.items():
         nodes = group_data.get("nodes", [])
         port = group_data.get("port")
-        controller = group_data.get("controller")
 
         print()
-        print(f"[{group_name}] port={port}, controller={controller}, nodes={len(nodes)}")
+        print(f"[{group_name}] port={port}, nodes={len(nodes)}")
 
         for node in nodes:
             print(f"  - {node}")

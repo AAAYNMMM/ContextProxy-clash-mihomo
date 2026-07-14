@@ -28,8 +28,7 @@ def get_default_settings() -> dict:
             "close_to_tray": True,
             "start_minimized": False,
             "auto_start_proxy": False,
-            "enable_system_proxy_on_start": True,
-            "disable_system_proxy_on_stop": True,
+            "auto_manage_system_proxy": True,
         },
         "logging": {
             "console_enabled": False,
@@ -82,6 +81,20 @@ def _merge_defaults(settings: dict) -> dict:
                 "timeout_ms": legacy_auto_select.get("delay_timeout_ms", 5000),
                 "test_url": legacy_auto_select.get("test_url", "https://www.gstatic.com/generate_204"),
             }
+
+    legacy_ui = settings.get("ui")
+    if isinstance(legacy_ui, dict) and "auto_manage_system_proxy" not in legacy_ui:
+        enable_on_start = legacy_ui.get("enable_system_proxy_on_start", True)
+        disable_on_stop = legacy_ui.get("disable_system_proxy_on_stop", True)
+        settings["ui"] = {
+            **legacy_ui,
+            "auto_manage_system_proxy": (
+                enable_on_start if isinstance(enable_on_start, bool) else True
+            )
+            and (
+                disable_on_stop if isinstance(disable_on_stop, bool) else True
+            ),
+        }
 
     for section, defaults in merged.items():
         incoming = settings.get(section, {})
@@ -137,8 +150,17 @@ def validate_settings(settings: dict) -> tuple[bool, str | None]:
     if not _is_port(mihomo.get("mixed_port")):
         return False, "mihomo mixed-port 必须是 1-65535"
 
-    if mihomo.get("controller_port") == mihomo.get("mixed_port"):
-        return False, "mihomo controller 端口和 mixed-port 不能相同"
+    seen_ports = {}
+    for label, port in (
+        ("本地代理", proxy.get("listen_port")),
+        ("Tab 上报接收", proxy.get("receiver_port")),
+        ("mihomo controller", mihomo.get("controller_port")),
+        ("mihomo mixed-port", mihomo.get("mixed_port")),
+    ):
+        existing_label = seen_ports.get(port)
+        if existing_label:
+            return False, f"{label} 与 {existing_label} 端口不能相同"
+        seen_ports[port] = label
 
     if not isinstance(latency_test.get("timeout_ms"), int) or latency_test["timeout_ms"] < 1000:
         return False, "\u5ef6\u8fdf\u6d4b\u8bd5\u8d85\u65f6\u5fc5\u987b\u5927\u4e8e\u7b49\u4e8e 1000 ms"

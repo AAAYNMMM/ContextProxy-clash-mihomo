@@ -6,9 +6,9 @@ from backend.paths import CONFIG_DIR
 GROUP_NODES_FILE = CONFIG_DIR / "group_nodes.yaml"
 
 DEFAULT_GROUP_CONFIG = {
-    "Proxy": {"port": 7890, "controller": 9090},
-    "AI": {"port": 7891, "controller": 9091},
-    "Media": {"port": 7892, "controller": 9092},
+    "Proxy": {"port": 7890},
+    "AI": {"port": 7891},
+    "Media": {"port": 7892},
 }
 
 _GROUP_CONFIG_CACHE = None
@@ -57,12 +57,7 @@ def _normalize_group_config(data: dict) -> dict:
             print(f"[runtime_config] ignore group without valid port: {group_name}")
             continue
 
-        controller = _to_int(group_data.get("controller"))
-        normalized = {"port": port}
-        if controller is not None:
-            normalized["controller"] = controller
-
-        result[str(group_name)] = normalized
+        result[str(group_name)] = {"port": port}
 
     return result
 
@@ -103,14 +98,6 @@ def get_group_port_map() -> dict:
         group_name: group_data["port"]
         for group_name, group_data in _get_group_config().items()
         if "port" in group_data
-    }
-
-
-def get_group_controller_map() -> dict:
-    return {
-        group_name: group_data["controller"]
-        for group_name, group_data in _get_group_config().items()
-        if "controller" in group_data
     }
 
 

@@ -40,8 +40,7 @@ DEFAULT_APP_SETTINGS = {
         "close_to_tray": True,
         "start_minimized": False,
         "auto_start_proxy": False,
-        "enable_system_proxy_on_start": True,
-        "disable_system_proxy_on_stop": True,
+        "auto_manage_system_proxy": True,
     },
     "logging": {
         "console_enabled": False,
@@ -55,17 +54,14 @@ DEFAULT_GROUP_NODES = {
     "groups": {
         "Proxy": {
             "port": 7890,
-            "controller": 9090,
             "nodes": [],
         },
         "AI": {
             "port": 7891,
-            "controller": 9091,
             "nodes": [],
         },
         "Media": {
             "port": 7892,
-            "controller": 9092,
             "nodes": [],
         },
     }
@@ -177,6 +173,17 @@ def ensure_group_nodes_file() -> None:
         existing["groups"] = deepcopy(DEFAULT_GROUP_NODES["groups"])
         existing["updated_at"] = _now_str()
         _save_yaml(GROUP_NODES_FILE, existing)
+        return
+
+    removed_legacy_controllers = False
+    for group_data in groups.values():
+        if isinstance(group_data, dict) and "controller" in group_data:
+            group_data.pop("controller", None)
+            removed_legacy_controllers = True
+
+    if removed_legacy_controllers:
+        existing["updated_at"] = _now_str()
+        _save_yaml(GROUP_NODES_FILE, existing)
 
 
 def ensure_node_pool_file() -> None:
@@ -194,7 +201,7 @@ def ensure_node_pool_file() -> None:
 def ensure_subscriptions_meta_file() -> None:
     SUBSCRIPTIONS_DIR.mkdir(parents=True, exist_ok=True)
     if not SUBSCRIPTIONS_META_FILE.is_file():
-        _save_yaml(SUBSCRIPTIONS_META_FILE, {"subscriptions": []})
+        _save_yaml(SUBSCRIPTIONS_META_FILE, {"subscriptions": {}})
 
 
 def ensure_rule_files() -> None:

@@ -10,3 +10,14 @@ __pycache__/
 .coverage
 coverage.xml
 htmlcov/
+
+# Generated Firefox extension packages
+dist/*.xpi
+dist/*.zip
+
+# Local runtime state: may contain credentials, subscriptions, logs, or binaries.
+app_processes.txt
+groups_domains.txt
+config/
+logs/
+mihomo/

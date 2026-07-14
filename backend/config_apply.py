@@ -55,6 +55,19 @@ def _write_rule_file_internal(path: Path, rules: list[tuple[str, str]]) -> None:
 def _settings_for_save(settings: dict) -> dict:
     merged = deepcopy(get_default_app_settings())
     settings = dict(settings or {})
+    legacy_ui = settings.get("ui")
+    if isinstance(legacy_ui, dict) and "auto_manage_system_proxy" not in legacy_ui:
+        enable_on_start = legacy_ui.get("enable_system_proxy_on_start", True)
+        disable_on_stop = legacy_ui.get("disable_system_proxy_on_stop", True)
+        settings["ui"] = {
+            **legacy_ui,
+            "auto_manage_system_proxy": (
+                enable_on_start if isinstance(enable_on_start, bool) else True
+            )
+            and (
+                disable_on_stop if isinstance(disable_on_stop, bool) else True
+            ),
+        }
     for section, defaults in merged.items():
         incoming = settings.get(section, {})
         if not isinstance(incoming, dict):
@@ -84,8 +97,18 @@ def validate_app_settings(settings: dict) -> tuple[bool, str | None]:
         return False, "mihomo controller 端口必须是 1-65535"
     if not _is_port(mihomo.get("mixed_port")):
         return False, "mihomo mixed-port 必须是 1-65535"
-    if mihomo.get("controller_port") == mihomo.get("mixed_port"):
-        return False, "mihomo controller 端口和 mixed-port 不能相同"
+
+    seen_ports = {}
+    for label, port in (
+        ("本地代理", proxy.get("listen_port")),
+        ("Tab 上报接收", proxy.get("receiver_port")),
+        ("mihomo controller", mihomo.get("controller_port")),
+        ("mihomo mixed-port", mihomo.get("mixed_port")),
+    ):
+        existing_label = seen_ports.get(port)
+        if existing_label:
+            return False, f"{label} 与 {existing_label} 端口不能相同"
+        seen_ports[port] = label
 
     latency_test = settings.get("latency_test", {})
     if not isinstance(latency_test.get("timeout_ms"), int) or latency_test["timeout_ms"] < 1000:
