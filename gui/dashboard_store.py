@@ -1,6 +1,5 @@
 from pathlib import Path
 import threading
-import time
 
 from backend.paths import APP_PROCESSES_FILE, CONFIG_DIR, GROUPS_DOMAINS_FILE
 from backend.runtime_snapshot import get_core_metrics
@@ -13,7 +12,7 @@ PROCESS_RULES_FILE = APP_PROCESSES_FILE
 
 _static_stats_lock = threading.RLock()
 _static_stats_cache: dict[str, int] | None = None
-_static_stats_cached_at = 0.0
+_static_stats_signature: tuple | None = None
 
 
 def _load_yaml(path: Path) -> dict:
@@ -49,6 +48,35 @@ def _count_rule_file(path: Path) -> int:
         return 0
 
     return count
+
+
+def _file_signature(path: Path) -> tuple[bool, int, int]:
+    try:
+        stat = path.stat()
+        return True, stat.st_mtime_ns, stat.st_size
+    except OSError:
+        return False, 0, 0
+
+
+def _dashboard_stats_signature() -> tuple:
+    try:
+        subscriptions_mtime = SUBSCRIPTIONS_DIR.stat().st_mtime_ns
+    except OSError:
+        subscriptions_mtime = 0
+    return (
+        _file_signature(GROUP_NODES_FILE),
+        _file_signature(NODE_POOL_FILE),
+        _file_signature(DOMAIN_RULES_FILE),
+        _file_signature(PROCESS_RULES_FILE),
+        subscriptions_mtime,
+    )
+
+
+def clear_dashboard_stats_cache() -> None:
+    global _static_stats_cache, _static_stats_signature
+    with _static_stats_lock:
+        _static_stats_cache = None
+        _static_stats_signature = None
 
 
 def count_groups() -> int:
@@ -99,11 +127,12 @@ def count_active_connections() -> int:
                     from backend.runtime_snapshot import update_core_metrics
 
                     update_core_metrics(data)
-                return int(data.get("active") or 0)
+                    return int(data.get("active") or 0)
     except Exception:
         pass
 
     return 0
+
 
 def get_core_events(after_id: int | None = 0, limit: int = 100) -> dict:
     try:
@@ -133,18 +162,17 @@ def get_core_events(after_id: int | None = 0, limit: int = 100) -> dict:
 
 
 def get_dashboard_stats(include_active_connections: bool = True) -> dict[str, int]:
-    global _static_stats_cache, _static_stats_cached_at
-    now = time.monotonic()
+    global _static_stats_cache, _static_stats_signature
+    signature = _dashboard_stats_signature()
     with _static_stats_lock:
-        if _static_stats_cache is None or now - _static_stats_cached_at > 1.0:
+        if _static_stats_cache is None or _static_stats_signature != signature:
             _static_stats_cache = {
                 "groups": count_groups(),
                 "nodes": count_nodes(),
                 "subscriptions": count_subscriptions(),
                 "rules": count_rules(),
             }
-            _static_stats_cached_at = now
+            _static_stats_signature = signature
         result = dict(_static_stats_cache)
     result["active_connections"] = count_active_connections() if include_active_connections else 0
     return result
-
