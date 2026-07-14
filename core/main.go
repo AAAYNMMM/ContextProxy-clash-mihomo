@@ -2791,13 +2791,13 @@ func (c *Core) adaptiveRelay(dst net.Conn, src io.Reader, id uint64, inDirection
 	high := false
 	buf := c.getRelayBuffer(settings.normalBufferSize, false)
 	writer := newTimedConnWriter(dst, settings.writeTimeout)
+	connInfo := c.getConn(id)
 	pendingBytes := int64(0)
 	lastStatsFlush := time.Now()
-	flushStats := func(force bool) {
+	flushStats := func(force bool, now time.Time) {
 		if pendingBytes == 0 {
 			return
 		}
-		now := time.Now()
 		if !force && pendingBytes < 256*1024 && now.Sub(lastStatsFlush) < 250*time.Millisecond {
 			return
 		}
@@ -2810,7 +2810,7 @@ func (c *Core) adaptiveRelay(dst net.Conn, src io.Reader, id uint64, inDirection
 		lastStatsFlush = now
 	}
 	defer func() {
-		flushStats(true)
+		flushStats(true, time.Now())
 		if high {
 			c.highThroughputDisabledCount.Add(1)
 			c.activeHighThroughputDirections.Add(-1)
@@ -2830,9 +2830,12 @@ func (c *Core) adaptiveRelay(dst net.Conn, src io.Reader, id uint64, inDirection
 				return err
 			}
 			pendingBytes += int64(n)
-			flushStats(false)
 			windowBytes += int64(n)
 			now := time.Now()
+			if connInfo.ID != 0 {
+				connInfo.LastActiveAt.Store(now.UnixNano())
+			}
+			flushStats(false, now)
 			if !high && now.Sub(windowStart) <= settings.highWindow && windowBytes >= settings.highBytes {
 				c.putRelayBuffer(buf, false)
 				buf = c.getRelayBuffer(settings.highBufferSize, true)

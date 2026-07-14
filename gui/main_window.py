@@ -48,13 +48,12 @@ from gui.auto_selector_store import (
     get_selected_node_for_group,
     load_runtime_selected_nodes,
 )
-from gui.dashboard_store import count_active_connections, get_core_events, get_dashboard_stats
+from gui.dashboard_store import get_dashboard_stats
 from gui.notification import show_error_animation, show_success_animation, show_warning_animation
 from gui.runtime_poller import RuntimePollWorker
 from gui.process_manager import (
     cleanup_proxy_residue,
     count_mihomo_processes,
-    get_backend_error,
     get_proxy_status,
     get_proxy_state,
     is_proxy_running,
