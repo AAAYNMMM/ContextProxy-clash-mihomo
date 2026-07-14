@@ -33,7 +33,30 @@ jobs:
         continue-on-error: true
         shell: pwsh
         run: |
-          python tools/apply_performance_patch.py *>&1 | Tee-Object "$env:RUNNER_TEMP\01-patch.txt"
+          @'
+          import base64
+          import re
+          import zlib
+          from pathlib import Path
+
+          path = Path("tools/apply_performance_patch.py")
+          wrapper = path.read_text(encoding="utf-8")
+          match = re.search(r"_PAYLOAD = r'''(.*?)'''", wrapper, re.S)
+          if not match:
+              raise RuntimeError("performance payload not found")
+          source = zlib.decompress(base64.b85decode(match.group(1).encode("ascii"))).decode("utf-8")
+          old = r'category = (category or "backend").strip().lower().replace("/", "_").replace("\\", "_")'
+          new = r'category = (category or "backend").strip().lower().replace("/", "_").replace("\\\\", "_")'
+          if source.count(old) != 1:
+              raise RuntimeError(f"activity bus escape repair expected one match, found {source.count(old)}")
+          source = source.replace(old, new, 1)
+          payload = base64.b85encode(zlib.compress(source.encode("utf-8"), 9)).decode("ascii")
+          repaired = "import base64\nimport zlib\n\n_PAYLOAD = r'''" + payload + "'''\n\nexec(compile(zlib.decompress(base64.b85decode(_PAYLOAD.encode(\"ascii\"))), __file__, \"exec\"))\n"
+          path.write_text(repaired, encoding="utf-8", newline="\n")
+          '@ | Set-Content "$env:RUNNER_TEMP\repair-performance-patch.py" -Encoding utf8
+          python "$env:RUNNER_TEMP\repair-performance-patch.py" *>&1 | Tee-Object "$env:RUNNER_TEMP\01-patch.txt"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python tools/apply_performance_patch.py *>&1 | Tee-Object -Append "$env:RUNNER_TEMP\01-patch.txt"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Format Go
