@@ -33,53 +33,82 @@ jobs:
         continue-on-error: true
         shell: pwsh
         run: |
-          python tools/apply_performance_patch.py *>&1 | Tee-Object "$env:RUNNER_TEMP\performance-patch-output.txt"
-          if ($LASTEXITCODE -ne 0) {
-            exit $LASTEXITCODE
-          }
-
-      - name: Publish patch failure
-        if: steps.apply_patch.outcome == 'failure'
-        shell: pwsh
-        run: |
-          git reset --hard HEAD
-          Copy-Item "$env:RUNNER_TEMP\performance-patch-output.txt" performance-patch-error.txt
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add performance-patch-error.txt
-          git commit -m "ci: record performance patch failure"
-          git push origin HEAD:${{ github.event.pull_request.head.ref }}
-          exit 1
+          python tools/apply_performance_patch.py *>&1 | Tee-Object "$env:RUNNER_TEMP\01-patch.txt"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Format Go
-        shell: pwsh
-        run: gofmt -w core/main.go
-
-      - name: Install Python test dependencies
+        id: format_go
+        if: steps.apply_patch.outcome == 'success'
+        continue-on-error: true
         shell: pwsh
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install pytest PyYAML requests psutil PySide6
+          gofmt -w core/main.go *>&1 | Tee-Object "$env:RUNNER_TEMP\02-gofmt.txt"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Install Python test dependencies
+        id: install_deps
+        if: steps.apply_patch.outcome == 'success' && steps.format_go.outcome == 'success'
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip *>&1 | Tee-Object "$env:RUNNER_TEMP\03-deps.txt"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -m pip install pytest PyYAML requests psutil PySide6 *>&1 | Tee-Object -Append "$env:RUNNER_TEMP\03-deps.txt"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Python syntax check
+        id: python_syntax
+        if: steps.install_deps.outcome == 'success'
+        continue-on-error: true
         shell: pwsh
-        run: python -m compileall -q backend gui
+        run: |
+          python -m compileall -q backend gui *>&1 | Tee-Object "$env:RUNNER_TEMP\04-python-syntax.txt"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Python tests
+        id: python_tests
+        if: steps.python_syntax.outcome == 'success'
+        continue-on-error: true
         shell: pwsh
         run: |
           if (Test-Path tests) {
-            python -m pytest -q
+            python -m pytest -q *>&1 | Tee-Object "$env:RUNNER_TEMP\05-pytest.txt"
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           } else {
-            Write-Host "No Python tests directory; syntax check completed."
+            "No Python tests directory; syntax check completed." | Tee-Object "$env:RUNNER_TEMP\05-pytest.txt"
           }
 
       - name: Go tests
+        id: go_tests
+        if: steps.python_tests.outcome == 'success'
+        continue-on-error: true
         shell: pwsh
         working-directory: core
-        run: go test ./...
+        run: |
+          go test ./... *>&1 | Tee-Object "$env:RUNNER_TEMP\06-go-test.txt"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Publish validation failure
+        if: always() && (steps.apply_patch.outcome == 'failure' || steps.format_go.outcome == 'failure' || steps.install_deps.outcome == 'failure' || steps.python_syntax.outcome == 'failure' || steps.python_tests.outcome == 'failure' || steps.go_tests.outcome == 'failure')
+        shell: pwsh
+        run: |
+          $report = Join-Path $env:RUNNER_TEMP "performance-validation-error.txt"
+          "Performance validation failed." | Set-Content $report
+          Get-ChildItem "$env:RUNNER_TEMP\0*.txt" -ErrorAction SilentlyContinue | Sort-Object Name | ForEach-Object {
+            Add-Content $report "`n===== $($_.Name) ====="
+            Get-Content $_.FullName -Tail 120 | Add-Content $report
+          }
+          git reset --hard HEAD
+          Copy-Item $report performance-patch-error.txt
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add performance-patch-error.txt
+          git commit -m "ci: record performance validation failure"
+          git push origin HEAD:${{ github.event.pull_request.head.ref }}
+          exit 1
 
       - name: Remove temporary patch machinery
+        if: steps.go_tests.outcome == 'success'
         shell: pwsh
         run: |
           Remove-Item tools/apply_performance_patch.py
@@ -90,6 +119,7 @@ jobs:
           }
 
       - name: Commit optimized implementation
+        if: steps.go_tests.outcome == 'success'
         shell: pwsh
         run: |
           git config user.name "github-actions[bot]"
