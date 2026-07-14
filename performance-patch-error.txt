@@ -1,0 +1,8 @@
+Traceback (most recent call last):
+  File "D:\a\ContextProxy\ContextProxy\tools\apply_performance_patch.py", line 6, in <module>
+    exec(compile(zlib.decompress(base64.b85decode(_PAYLOAD.encode("ascii"))), __file__, "exec"))
+  File "D:\a\ContextProxy\ContextProxy\tools\apply_performance_patch.py", line 1538, in <module>
+  File "D:\a\ContextProxy\ContextProxy\tools\apply_performance_patch.py", line 1532, in main
+  File "D:\a\ContextProxy\ContextProxy\tools\apply_performance_patch.py", line 681, in patch_main_window
+  File "D:\a\ContextProxy\ContextProxy\tools\apply_performance_patch.py", line 22, in replace_once
+RuntimeError: main window performance attrs: expected one match, found 3
