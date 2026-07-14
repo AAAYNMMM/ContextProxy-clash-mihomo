@@ -606,8 +606,15 @@ class MainWindow(QMainWindow):
             )
         )
         layout.addWidget(self.activity_log, 1)
+        QTimer.singleShot(0, self._scroll_activity_log_to_latest)
         self.refresh_dashboard()
         return page
+
+    def _scroll_activity_log_to_latest(self):
+        if not self.activity_log:
+            return
+        scroll_bar = self.activity_log.verticalScrollBar()
+        scroll_bar.setValue(scroll_bar.maximum())
 
     def _append_activity_log(self, message: str, level: str = "INFO"):
         if not self.activity_log:
