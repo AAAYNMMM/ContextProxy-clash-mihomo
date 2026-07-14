@@ -38,7 +38,11 @@ jobs:
 
           def replace_once(path: Path, old: str, new: str, label: str) -> None:
               text = path.read_text(encoding="utf-8")
-              if new and new in text:
+              if new:
+                  if new in text:
+                      print(f"already applied: {label}")
+                      return
+              elif old not in text:
                   print(f"already applied: {label}")
                   return
               count = text.count(old)
@@ -141,8 +145,6 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add gui/main_window.py core/main.go
-          if (Test-Path performance-review-error.txt) {
-            git add performance-review-error.txt
-          }
-          git commit -m "perf: preserve activity accuracy and UI state"
+          git add -u -- performance-review-error.txt
+          git commit -m "chore: remove final review diagnostics"
           git push origin HEAD:${{ github.event.pull_request.head.ref }}
