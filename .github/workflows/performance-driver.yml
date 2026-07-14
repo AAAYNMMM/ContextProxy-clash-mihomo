@@ -29,18 +29,22 @@ jobs:
           go-version: '1.22.x'
 
       - name: Apply final review fixes
+        id: review_fixes
+        continue-on-error: true
         shell: pwsh
         run: |
           @'
           from pathlib import Path
 
-          def replace_once(path: Path, old: str, new: str) -> None:
+          def replace_once(path: Path, old: str, new: str, label: str) -> None:
               text = path.read_text(encoding="utf-8")
-              if new in text:
+              if new and new in text:
+                  print(f"already applied: {label}")
                   return
               count = text.count(old)
+              print(f"{label}: matches={count}")
               if count != 1:
-                  raise RuntimeError(f"{path}: expected one match, found {count}")
+                  raise RuntimeError(f"{path}: {label} expected one match, found {count}")
               path.write_text(text.replace(old, new, 1), encoding="utf-8", newline="\n")
 
           main = Path("gui/main_window.py")
@@ -48,114 +52,67 @@ jobs:
               main,
               "from gui.dashboard_store import count_active_connections, get_core_events, get_dashboard_stats",
               "from gui.dashboard_store import get_dashboard_stats",
+              "dashboard imports",
           )
-          replace_once(main, "    get_backend_error,\n", "")
-
-          replace_once(
-              main,
-              '''        if self.node_pool_table:
-              table = self.node_pool_table
-              table.setUpdatesEnabled(False)
-              try:
-          ''',
-              '''        if self.node_pool_table:
-              table = self.node_pool_table
-              previous_updates = table.updatesEnabled()
-              table.setUpdatesEnabled(False)
-              try:
-          ''',
-          )
-          replace_once(
-              main,
-              '''            finally:
-                  table.setUpdatesEnabled(True)
-              if self.group_node_table:
-                  table = self.group_node_table
-                  table.setUpdatesEnabled(False)
-                  try:
-          ''',
-              '''            finally:
-                  table.setUpdatesEnabled(previous_updates)
-              if self.group_node_table:
-                  table = self.group_node_table
-                  previous_updates = table.updatesEnabled()
-                  table.setUpdatesEnabled(False)
-                  try:
-          ''',
-          )
-          replace_once(
-              main,
-              '''            finally:
-                  table.setUpdatesEnabled(True)
-
-              def _finish_node_delay_test(self, result: dict):
-          ''',
-              '''            finally:
-                  table.setUpdatesEnabled(previous_updates)
-
-              def _finish_node_delay_test(self, result: dict):
-          ''',
-          )
+          replace_once(main, "    get_backend_error,\n", "", "backend error import")
 
           core = Path("core/main.go")
           replace_once(
               core,
-              '''\twriter := newTimedConnWriter(dst, settings.writeTimeout)
-          \tpendingBytes := int64(0)
-          \tlastStatsFlush := time.Now()
-          \tflushStats := func(force bool) {
-          \t\tif pendingBytes == 0 {
-          \t\t\treturn
-          \t\t}
-          \t\tnow := time.Now()
-          ''',
-              '''\twriter := newTimedConnWriter(dst, settings.writeTimeout)
-          \tconnInfo := c.getConn(id)
-          \tpendingBytes := int64(0)
-          \tlastStatsFlush := time.Now()
-          \tflushStats := func(force bool, now time.Time) {
-          \t\tif pendingBytes == 0 {
-          \t\t\treturn
-          \t\t}
-          ''',
+              "\twriter := newTimedConnWriter(dst, settings.writeTimeout)\n\tpendingBytes := int64(0)\n\tlastStatsFlush := time.Now()\n\tflushStats := func(force bool) {\n\t\tif pendingBytes == 0 {\n\t\t\treturn\n\t\t}\n\t\tnow := time.Now()\n",
+              "\twriter := newTimedConnWriter(dst, settings.writeTimeout)\n\tconnInfo := c.getConn(id)\n\tpendingBytes := int64(0)\n\tlastStatsFlush := time.Now()\n\tflushStats := func(force bool, now time.Time) {\n\t\tif pendingBytes == 0 {\n\t\t\treturn\n\t\t}\n",
+              "relay batch closure",
           )
-          replace_once(core, "\t\tflushStats(true)\n", "\t\tflushStats(true, time.Now())\n")
           replace_once(
               core,
-              '''\t\t\tpendingBytes += int64(n)
-          \t\t\tflushStats(false)
-          \t\t\twindowBytes += int64(n)
-          \t\t\tnow := time.Now()
-          ''',
-              '''\t\t\tpendingBytes += int64(n)
-          \t\t\twindowBytes += int64(n)
-          \t\t\tnow := time.Now()
-          \t\t\tif connInfo.ID != 0 {
-          \t\t\t\tconnInfo.LastActiveAt.Store(now.UnixNano())
-          \t\t\t}
-          \t\t\tflushStats(false, now)
-          ''',
+              "\t\tflushStats(true)\n",
+              "\t\tflushStats(true, time.Now())\n",
+              "relay final flush",
+          )
+          replace_once(
+              core,
+              "\t\t\tpendingBytes += int64(n)\n\t\t\tflushStats(false)\n\t\t\twindowBytes += int64(n)\n\t\t\tnow := time.Now()\n",
+              "\t\t\tpendingBytes += int64(n)\n\t\t\twindowBytes += int64(n)\n\t\t\tnow := time.Now()\n\t\t\tif connInfo.ID != 0 {\n\t\t\t\tconnInfo.LastActiveAt.Store(now.UnixNano())\n\t\t\t}\n\t\t\tflushStats(false, now)\n",
+              "relay activity touch",
           )
           '@ | Set-Content "$env:RUNNER_TEMP\final-review-fixes.py" -Encoding utf8
-          python "$env:RUNNER_TEMP\final-review-fixes.py"
+          python "$env:RUNNER_TEMP\final-review-fixes.py" *>&1 | Tee-Object "$env:RUNNER_TEMP\review-fixes.txt"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Publish review-fix failure
+        if: steps.review_fixes.outcome == 'failure'
+        shell: pwsh
+        run: |
+          git reset --hard HEAD
+          Copy-Item "$env:RUNNER_TEMP\review-fixes.txt" performance-review-error.txt
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add performance-review-error.txt
+          git commit -m "ci: record final review patch failure"
+          git push origin HEAD:${{ github.event.pull_request.head.ref }}
+          exit 1
 
       - name: Format Go
+        if: steps.review_fixes.outcome == 'success'
         shell: pwsh
         run: gofmt -w core/main.go
 
       - name: Install Python test dependencies
+        if: steps.review_fixes.outcome == 'success'
         shell: pwsh
         run: |
           python -m pip install --upgrade pip
           python -m pip install pytest PyYAML requests psutil PySide6
 
       - name: Python syntax check
+        if: steps.review_fixes.outcome == 'success'
         shell: pwsh
         env:
           PYTHONPYCACHEPREFIX: ${{ runner.temp }}\contextproxy-pycache
         run: python -m compileall -q backend gui
 
       - name: Python tests
+        if: steps.review_fixes.outcome == 'success'
         shell: pwsh
         env:
           PYTHONPYCACHEPREFIX: ${{ runner.temp }}\contextproxy-pycache
@@ -167,19 +124,22 @@ jobs:
           }
 
       - name: Go tests
+        if: steps.review_fixes.outcome == 'success'
         shell: pwsh
         working-directory: core
         run: go test ./...
 
       - name: Commit reviewed implementation
+        if: steps.review_fixes.outcome == 'success'
         shell: pwsh
         run: |
+          Remove-Item performance-review-error.txt -ErrorAction SilentlyContinue
           if (-not (git status --porcelain)) {
             Write-Host "No review fixes to commit."
             exit 0
           }
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add gui/main_window.py core/main.go
+          git add gui/main_window.py core/main.go performance-review-error.txt 2>$null
           git commit -m "perf: preserve activity accuracy and UI state"
           git push origin HEAD:${{ github.event.pull_request.head.ref }}
