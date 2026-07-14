@@ -1,0 +1,70 @@
+Performance validation failed.
+
+===== 01-patch.txt =====
+performance patch applied
+
+===== 03-deps.txt =====
+Requirement already satisfied: pip in C:\hostedtoolcache\windows\Python\3.12.10\x64\Lib\site-packages (26.1.2)
+Collecting pytest
+  Downloading pytest-9.1.1-py3-none-any.whl.metadata (7.6 kB)
+Collecting PyYAML
+  Downloading pyyaml-6.0.3-cp312-cp312-win_amd64.whl.metadata (2.4 kB)
+Collecting requests
+  Downloading requests-2.34.2-py3-none-any.whl.metadata (4.8 kB)
+Collecting psutil
+  Downloading psutil-7.2.2-cp37-abi3-win_amd64.whl.metadata (22 kB)
+Collecting PySide6
+  Downloading pyside6-6.11.1-cp310-abi3-win_amd64.whl.metadata (5.5 kB)
+Requirement already satisfied: colorama>=0.4 in C:\hostedtoolcache\windows\Python\3.12.10\x64\Lib\site-packages (from pytest) (0.4.6)
+Collecting iniconfig>=1.0.1 (from pytest)
+  Downloading iniconfig-2.3.0-py3-none-any.whl.metadata (2.5 kB)
+Requirement already satisfied: packaging>=22 in C:\hostedtoolcache\windows\Python\3.12.10\x64\Lib\site-packages (from pytest) (26.2)
+Collecting pluggy<2,>=1.5 (from pytest)
+  Downloading pluggy-1.6.0-py3-none-any.whl.metadata (4.8 kB)
+Collecting pygments>=2.7.2 (from pytest)
+  Downloading pygments-2.20.0-py3-none-any.whl.metadata (2.5 kB)
+Collecting charset_normalizer<4,>=2 (from requests)
+  Downloading charset_normalizer-3.4.9-cp312-cp312-win_amd64.whl.metadata (42 kB)
+Collecting idna<4,>=2.5 (from requests)
+  Downloading idna-3.18-py3-none-any.whl.metadata (6.1 kB)
+Collecting urllib3<3,>=1.26 (from requests)
+  Downloading urllib3-2.7.0-py3-none-any.whl.metadata (6.9 kB)
+Collecting certifi>=2023.5.7 (from requests)
+  Downloading certifi-2026.6.17-py3-none-any.whl.metadata (2.5 kB)
+Collecting shiboken6==6.11.1 (from PySide6)
+  Downloading shiboken6-6.11.1-cp310-abi3-win_amd64.whl.metadata (2.5 kB)
+Collecting PySide6_Essentials==6.11.1 (from PySide6)
+  Downloading pyside6_essentials-6.11.1-cp310-abi3-win_amd64.whl.metadata (3.8 kB)
+Collecting PySide6_Addons==6.11.1 (from PySide6)
+  Downloading pyside6_addons-6.11.1-cp310-abi3-win_amd64.whl.metadata (4.2 kB)
+Downloading pytest-9.1.1-py3-none-any.whl (386 kB)
+Downloading pluggy-1.6.0-py3-none-any.whl (20 kB)
+Downloading pyyaml-6.0.3-cp312-cp312-win_amd64.whl (154 kB)
+Downloading requests-2.34.2-py3-none-any.whl (73 kB)
+Downloading charset_normalizer-3.4.9-cp312-cp312-win_amd64.whl (162 kB)
+Downloading idna-3.18-py3-none-any.whl (65 kB)
+Downloading urllib3-2.7.0-py3-none-any.whl (131 kB)
+Downloading psutil-7.2.2-cp37-abi3-win_amd64.whl (137 kB)
+Downloading pyside6-6.11.1-cp310-abi3-win_amd64.whl (578 kB)
+   ---------------------------------------- 578.4/578.4 kB 10.2 MB/s  0:00:00
+Downloading pyside6_addons-6.11.1-cp310-abi3-win_amd64.whl (168.8 MB)
+   ---------------------------------------- 168.8/168.8 MB 73.9 MB/s  0:00:02
+Downloading pyside6_essentials-6.11.1-cp310-abi3-win_amd64.whl (77.5 MB)
+   ---------------------------------------- 77.5/77.5 MB 86.8 MB/s  0:00:00
+Downloading shiboken6-6.11.1-cp310-abi3-win_amd64.whl (1.2 MB)
+   ---------------------------------------- 1.2/1.2 MB 31.0 MB/s  0:00:00
+Downloading certifi-2026.6.17-py3-none-any.whl (133 kB)
+Downloading iniconfig-2.3.0-py3-none-any.whl (7.5 kB)
+Downloading pygments-2.20.0-py3-none-any.whl (1.2 MB)
+   ---------------------------------------- 1.2/1.2 MB 31.3 MB/s  0:00:00
+Installing collected packages: urllib3, shiboken6, PyYAML, pygments, psutil, pluggy, iniconfig, idna, charset_normalizer, certifi, requests, pytest, PySide6_Essentials, PySide6_Addons, PySide6
+
+Successfully installed PySide6-6.11.1 PySide6_Addons-6.11.1 PySide6_Essentials-6.11.1 PyYAML-6.0.3 certifi-2026.6.17 charset_normalizer-3.4.9 idna-3.18 iniconfig-2.3.0 pluggy-1.6.0 psutil-7.2.2 pygments-2.20.0 pytest-9.1.1 requests-2.34.2 shiboken6-6.11.1 urllib3-2.7.0
+
+===== 04-python-syntax.txt =====
+*** Error compiling 'backend\\activity_bus.py'...
+  File "backend\activity_bus.py", line 150
+    category = (category or "backend").strip().lower().replace("/", "_").replace("\", "_")
+                                                                                        ^
+SyntaxError: unterminated string literal (detected at line 150)
+
